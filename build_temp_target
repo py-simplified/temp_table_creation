@@ -1,0 +1,92 @@
+CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(config_fqn STRING, selected_targets ARRAY<STRING>)
+BEGIN
+  -- Stage config without DML (sandbox-safe)
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE TEMP TABLE tmp_cfg AS
+    SELECT *
+    FROM `%s`
+    WHERE Target_Table IS NOT NULL
+      AND Target_Column IS NOT NULL
+      AND Derivation_Logic IS NOT NULL
+  """, config_fqn);
+
+  FOR t IN (
+    SELECT DISTINCT Target_Project_Id, Target_Dataset_Id, Target_Table
+    FROM tmp_cfg
+    WHERE ARRAY_LENGTH(selected_targets) = 0
+       OR Target_Table IN UNNEST(selected_targets)
+    ORDER BY Target_Project_Id, Target_Dataset_Id, Target_Table
+  )
+  DO
+    BEGIN
+      DECLARE src_count INT64;
+      DECLARE dup_cols INT64;
+      DECLARE src STRUCT<p STRING, d STRING, t STRING>;
+      DECLARE select_list STRING;
+      DECLARE ddl STRING;
+
+      -- Single source per target
+      SET src_count = (
+        SELECT COUNT(DISTINCT TO_JSON_STRING(STRUCT(Source_Project_Id, Source_Dataset_Id, Source_Table)))
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+      ASSERT src_count = 1 AS 'Each target must map to exactly one source table (Project/Dataset/Table).';
+
+      -- No duplicate target columns
+      SET dup_cols = (
+        SELECT COUNT(1)
+        FROM (
+          SELECT Target_Column, COUNT(*) c
+          FROM tmp_cfg
+          WHERE Target_Project_Id = t.Target_Project_Id
+            AND Target_Dataset_Id = t.Target_Dataset_Id
+            AND Target_Table      = t.Target_Table
+          GROUP BY Target_Column
+          HAVING COUNT(*) > 1
+        )
+      );
+      ASSERT dup_cols = 0 AS 'Duplicate Target_Column entries found for this target.';
+
+      -- Source triple
+      SET src = (
+        SELECT AS STRUCT
+          ANY_VALUE(Source_Project_Id) AS p,
+          ANY_VALUE(Source_Dataset_Id) AS d,
+          ANY_VALUE(Source_Table)      AS t
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+
+      -- Projection
+      SET select_list = (
+        SELECT STRING_AGG(FORMAT('%s AS `%s`', Derivation_Logic, Target_Column), ',\n  ' ORDER BY Scenario_ID, Target_Column)
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+      ASSERT select_list IS NOT NULL AND LENGTH(select_list) > 0 AS 'No columns to select for this target.';
+
+      -- CTAS (no CLUSTER BY to avoid FLOAT64 restriction)
+      SET ddl = FORMAT("""
+        CREATE OR REPLACE TABLE `%s.%s.%s_Temp`
+        AS
+        SELECT
+          %s
+        FROM `%s.%s.%s` AS `%s`
+      """,
+        t.Target_Project_Id, t.Target_Dataset_Id, t.Target_Table,
+        select_list,
+        src.p, src.d, src.t,
+        src.t
+      );
+
+      EXECUTE IMMEDIATE ddl;
+    END;
+  END FOR;
+END;
