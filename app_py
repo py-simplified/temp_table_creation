@@ -1,1 +1,187 @@
+import io
+import time
+from typing import List, Optional
+
+import pandas as pd
+import streamlit as st
+from google.cloud import bigquery
+from google.cloud.bigquery import SchemaField
+from google.cloud.bigquery import LoadJobConfig
+from google.cloud.bigquery import ScalarQueryParameter, ArrayQueryParameter
+
+# -----------------------------
+# Configuration
+# -----------------------------
+PROJECT_ID = "cohesive-apogee-411113"
+DATASET_ID = "banking_sample_data"
+TABLE_ID = "Validation_Scenarios"  # config table name
+TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+PROC_FQN = f"{PROJECT_ID}.{DATASET_ID}.build_temp_targets"
+
+REQUIRED_COLS = [
+    "Source_Project_Id",
+    "Source_Dataset_Id",
+    "Source_Table",
+    "Target_Project_Id",
+    "Target_Dataset_Id",
+    "Target_Table",
+    "Target_Column",
+    "Derivation_Logic",
+]
+
+# Canonical casing for common columns (case-insensitive mapping)
+CANONICAL_MAP = {
+    "scenario_id": "Scenario_ID",
+    "scenario_name": "Scenario_Name",
+    "description": "Description",
+    "source_project_id": "Source_Project_Id",
+    "source_dataset_id": "Source_Dataset_Id",
+    "source_table": "Source_Table",
+    "target_project_id": "Target_Project_Id",
+    "target_dataset_id": "Target_Dataset_Id",
+    "target_table": "Target_Table",
+    "target_column": "Target_Column",
+    "reference_table": "Reference_Table",
+    "reference_join_key": "Reference_Join_Key",
+    "reference_lookup_column": "Reference_Lookup_Column",
+    "derivation_logic": "Derivation_Logic",
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_bq_client():
+    return bigquery.Client(project=PROJECT_ID)
+
+def _sanitize_col(col: str) -> str:
+    s = col.strip().replace("\n", " ").replace("-", "_").replace(" ", "_")
+    s = "_".join([p for p in s.split("_") if p])  # collapse repeats
+    return s
+
+def _canonicalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    new_cols = []
+    for c in df.columns:
+        key = _sanitize_col(c).lower()
+        new_cols.append(CANONICAL_MAP.get(key, _sanitize_col(c)))
+    df.columns = new_cols
+    return df
+
+def ensure_config_table(client: bigquery.Client, df: pd.DataFrame):
+    try:
+        client.get_table(TABLE_FQN)
+        table_exists = True
+    except Exception:
+        table_exists = False
+
+    if not table_exists:
+        schema = [SchemaField(col, "STRING") for col in df.columns]
+        table = bigquery.Table(TABLE_FQN, schema=schema)
+        client.create_table(table)
+    else:
+        tbl = client.get_table(TABLE_FQN)
+        existing_cols = {sch.name.lower() for sch in tbl.schema}
+        to_add = [c for c in df.columns if c.lower() not in existing_cols]
+        for col in to_add:
+            ddl = f"ALTER TABLE `{TABLE_FQN}` ADD COLUMN IF NOT EXISTS `{col}` STRING"
+            client.query(ddl).result()
+
+def load_excel_to_bq(excel_bytes: bytes, mode: str):
+    client = get_bq_client()
+    df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=0, engine="openpyxl")
+    df = _canonicalize_headers(df)
+
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    ensure_config_table(client, df)
+
+    job_config = LoadJobConfig()
+    if mode == "Recreate (Full Refresh)":
+        job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
+    elif mode == "Append (Add New Rows)":
+        job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
+    else:
+        raise ValueError("Invalid load mode")
+
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+
+    load_job = client.load_table_from_dataframe(df, TABLE_FQN, job_config=job_config)
+    load_job.result()
+
+def list_components() -> List[str]:
+    client = get_bq_client()
+    sql = f"SELECT DISTINCT Target_Table FROM `{TABLE_FQN}` WHERE Target_Table IS NOT NULL ORDER BY Target_Table"
+    rows = client.query(sql).result()
+    return [row["Target_Table"] for row in rows]
+
+def preview_config(limit: int = 50) -> pd.DataFrame:
+    client = get_bq_client()
+    sql = f"SELECT * FROM `{TABLE_FQN}` LIMIT {limit}"
+    return client.query(sql).to_dataframe()
+
+def call_build_proc(selected: Optional[List[str]]):
+    client = get_bq_client()
+    sql = f"CALL `{PROC_FQN}`(@cfg, @targets)"
+    params = [
+        ScalarQueryParameter("cfg", "STRING", TABLE_FQN),
+        ArrayQueryParameter("targets", "STRING", selected if selected else []),
+    ]
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+    job.result()
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Validation Scenarios Manager", layout="wide")
+st.title("Validation Scenarios Manager")
+st.caption(f"Config table: `{TABLE_FQN}` · Procedure: `{PROC_FQN}`")
+
+with st.expander("1) Upload or Update Config (Excel → BigQuery)", expanded=True):
+    uploaded = st.file_uploader("Upload Validation_Scenarios Excel (.xlsx)", type=["xlsx"])
+    mode = st.radio("Upload mode", ["Recreate (Full Refresh)", "Append (Add New Rows)"], index=0, horizontal=True)
+    if st.button("Upload to BigQuery", type="primary", disabled=uploaded is None):
+        if not uploaded:
+            st.error("Please upload an Excel file.")
+        else:
+            try:
+                with st.spinner("Uploading..."):
+                    load_excel_to_bq(uploaded.getvalue(), mode)
+                st.success(f"Upload complete with mode: {mode}")
+            except Exception as e:
+                st.exception(e)
+
+with st.expander("2) Components Selection", expanded=True):
+    try:
+        components = list_components()
+        select_all = st.checkbox("Select All", value=False)
+        default = components if select_all else []
+        selected = st.multiselect("Target tables", components, default=default)
+
+        st.write("Preview (first 50 rows):")
+        try:
+            df_prev = preview_config(50)
+            st.dataframe(df_prev, use_container_width=True, hide_index=True)
+        except Exception:
+            st.info("Config table preview not available yet.")
+    except Exception:
+        st.info("Config table not found. Upload the Excel first.")
+        selected = []
+
+with st.expander("3) Build Temp Tables", expanded=True):
+    if st.button("Run Stored Procedure", type="primary"):
+        try:
+            start = time.strftime("%Y-%m-%d %H:%M:%S")
+            with st.spinner("Running stored procedure..."):
+                call_build_proc(selected)
+            end = time.strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"Completed. Started: {start} · Finished: {end}")
+            st.code(f"CALL `{PROC_FQN}`('{TABLE_FQN}', {selected if selected else 'NULL'});")
+        except Exception as e:
+            st.exception(e)
+
+st.divider()
+st.caption("Note: Uses Application Default Credentials. Locally: `gcloud auth application-default login`.")
 
