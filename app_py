@@ -353,6 +353,34 @@ with st.expander("3) Build Temp Tables", expanded=False):
         except Exception as e:
             st.exception(e)
 
+# --- New expander for sample data preview ---
+show_data = st.checkbox("Show 5 rows from each created temp table (after procedure run)")
+if show_data and selected:
+    with st.expander("Sample Data from Created Temp Tables", expanded=True):
+        client = get_bq_client()
+        config_df = preview_config(1000)
+        ctas_sqls = generate_ctas_sqls(config_df, selected)
+        for item in ctas_sqls:
+            temp_table = item['table']
+            try:
+                # Try to get project, dataset, and table from config for this temp table
+                base_table = temp_table.replace('_Temp', '')
+                # Find matching row in config_df
+                match = config_df[config_df['Target_Table'] == base_table]
+                if not match.empty:
+                    proj = match.iloc[0]['Target_Project_Id']
+                    ds = match.iloc[0]['Target_Dataset_Id']
+                    tbl = match.iloc[0]['Target_Table']
+                    temp_fqn = f"{proj}.{ds}.{tbl}_Temp"
+                    sql = f"SELECT * FROM `{temp_fqn}` LIMIT 5"
+                    df = client.query(sql).to_dataframe()
+                    st.markdown(f"**{temp_fqn}**")
+                    st.dataframe(df)
+                else:
+                    st.warning(f"Could not find config for temp table {temp_table}")
+            except Exception as e:
+                st.error(f"Error fetching data from {temp_table}: {e}")
+
 
 # Footer note for authentication
 st.divider()
