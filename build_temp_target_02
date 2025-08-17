@@ -1,0 +1,165 @@
+CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(
+  config_fqn STRING,
+  selected_targets ARRAY<STRING>
+)
+BEGIN
+  -- 1) Stage valid config rows
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE TEMP TABLE tmp_cfg AS
+    SELECT *
+    FROM `%s`
+    WHERE Target_Table      IS NOT NULL
+      AND Target_Column     IS NOT NULL
+      AND Derivation_Logic  IS NOT NULL
+  """, config_fqn);
+
+  -- 2) Iterate targets
+  FOR t IN (
+    SELECT DISTINCT Target_Project_Id, Target_Dataset_Id, Target_Table
+    FROM tmp_cfg
+    WHERE ARRAY_LENGTH(selected_targets) = 0
+       OR Target_Table IN UNNEST(selected_targets)
+    ORDER BY Target_Project_Id, Target_Dataset_Id, Target_Table
+  ) DO
+    BEGIN
+      -- Declarations (must be at top)
+      DECLARE src_p STRING;
+      DECLARE src_d STRING;
+      DECLARE src_t STRING;
+      DECLARE src_count INT64;
+      DECLARE dup_cols INT64;
+      DECLARE join_clauses STRING DEFAULT '';
+      DECLARE select_list STRING;
+      DECLARE ref_pattern STRING;          -- dynamic alternation: e.g. "reference_mapping|reference_mapping_01"
+      DECLARE has_refs BOOL;
+
+      -- 3) Get single source triple
+      SET (src_p, src_d, src_t) = (
+        SELECT AS STRUCT
+          ANY_VALUE(Source_Project_Id),
+          ANY_VALUE(Source_Dataset_Id),
+          ANY_VALUE(Source_Table)
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+
+      -- 4) Validate exactly one source
+      SET src_count = (
+        SELECT COUNT(DISTINCT TO_JSON_STRING(STRUCT(Source_Project_Id, Source_Dataset_Id, Source_Table)))
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+      ASSERT src_count = 1 AS 'Each target must map to exactly one source table (Project/Dataset/Table).';
+
+      -- 5) No duplicate target columns
+      SET dup_cols = (
+        SELECT COUNT(*)
+        FROM (
+          SELECT Target_Column
+          FROM tmp_cfg
+          WHERE Target_Project_Id = t.Target_Project_Id
+            AND Target_Dataset_Id = t.Target_Dataset_Id
+            AND Target_Table      = t.Target_Table
+          GROUP BY Target_Column
+          HAVING COUNT(*) > 1
+        )
+      );
+      ASSERT dup_cols = 0 AS 'Duplicate Target_Column entries found for this target.';
+
+      -- 6) Build dynamic reference table pattern (escaped, OR-joined), and join clauses
+      SET ref_pattern = (
+        SELECT STRING_AGG(
+                 -- Escape any regex metacharacters in table names, just in case
+                 REGEXP_REPLACE(Reference_Table, r'([.^$|()\[\]\\+*?{}-])', r'\\\1'),
+                 '|'
+               )
+        FROM (
+          SELECT DISTINCT Reference_Table
+          FROM tmp_cfg
+          WHERE Target_Project_Id = t.Target_Project_Id
+            AND Target_Dataset_Id = t.Target_Dataset_Id
+            AND Target_Table      = t.Target_Table
+            AND Reference_Table IS NOT NULL
+            AND LOWER(Reference_Table) != 'nan'
+        )
+      );
+
+      SET has_refs = (ref_pattern IS NOT NULL AND LENGTH(ref_pattern) > 0);
+
+      IF has_refs THEN
+        -- Build one LEFT JOIN per distinct valid reference table; alias = table name
+        SET join_clauses = (
+          SELECT STRING_AGG(
+                   FORMAT(
+                     'LEFT JOIN `%s.%s.%s` AS `%s` ON `%s`.`%s` = `%s`.`%s`',
+                     src_p, src_d, Reference_Table, Reference_Table,
+                     src_t, Reference_Lookup_Column,
+                     Reference_Table, Reference_Join_Key
+                   ),
+                   '\n'
+                 )
+          FROM (
+            SELECT DISTINCT Reference_Table, Reference_Join_Key, Reference_Lookup_Column
+            FROM tmp_cfg
+            WHERE Target_Project_Id = t.Target_Project_Id
+              AND Target_Dataset_Id = t.Target_Dataset_Id
+              AND Target_Table      = t.Target_Table
+              AND Reference_Table IS NOT NULL
+              AND LOWER(Reference_Table) != 'nan'
+              AND Reference_Join_Key IS NOT NULL
+              AND Reference_Lookup_Column IS NOT NULL
+          )
+        );
+      END IF;
+
+      -- 7) Build SELECT list, row-by-row fixups:
+      --    If a row has a Reference_Table, rewrite any leading reference-table prefix
+      --    (or generic 'ref.') to that specific Reference_Table.
+      SET select_list = (
+        SELECT STRING_AGG(
+                 FORMAT('%s AS `%s`',
+                   CASE
+                     WHEN Reference_Table IS NOT NULL AND LOWER(Reference_Table) != 'nan' THEN
+                       -- First, if expression uses any known ref-table prefix, rewrite it to THIS row's Reference_Table
+                       REGEXP_REPLACE(
+                         -- Also rewrite a generic 'ref.' prefix if someone used it in config
+                         REGEXP_REPLACE(Derivation_Logic,
+                                        r'\bref\.', CONCAT(Reference_Table, '.')),
+                         CONCAT('\\b(', ref_pattern, ')\\.'),
+                         CONCAT(Reference_Table, '.')
+                       )
+                     ELSE
+                       Derivation_Logic
+                   END,
+                   Target_Column
+                 ),
+                 ',\n  ' ORDER BY Scenario_ID, Target_Column
+               )
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+      ASSERT select_list IS NOT NULL AND LENGTH(select_list) > 0 AS 'No columns to select for this target.';
+
+      -- 8) Execute CTAS
+      EXECUTE IMMEDIATE FORMAT("""
+        CREATE OR REPLACE TABLE `%s.%s.%s_Temp` AS
+        SELECT
+          %s
+        FROM `%s.%s.%s` AS `%s`
+        %s
+      """,
+        t.Target_Project_Id, t.Target_Dataset_Id, t.Target_Table,
+        select_list,
+        src_p, src_d, src_t,
+        src_t,
+        IFNULL(join_clauses, '')
+      );
+    END;
+  END FOR;
+END;
