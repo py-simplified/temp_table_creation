@@ -204,14 +204,16 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
             continue
 
         # --- Final CTAS SQL ---
+                # New temp table name: <Target_Table>_<Source_Dataset_Id>_Temp
+        temp_table_name = f"{tbl}_{source['Source_Dataset_Id']}_Temp"
         ctas = f"""
-    CREATE OR REPLACE TABLE `{proj}.{ds}.{tbl}_Temp` AS
-    SELECT
-      {projection}
-    FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
-    {join_sql}
-    """
-        ctas_sqls.append({"table": f"{tbl}_Temp", "sql": ctas.strip()})
+        CREATE OR REPLACE TABLE `{proj}.{ds}.{temp_table_name}` AS
+        SELECT
+            {projection}
+        FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
+        {join_sql}
+        """
+        ctas_sqls.append({"table": temp_table_name, "sql": ctas.strip()})
     return ctas_sqls
 
     # --- CTAS SQL Preview Helper ---
@@ -363,21 +365,29 @@ if show_data and selected:
         for item in ctas_sqls:
             temp_table = item['table']
             try:
-                # Try to get project, dataset, and table from config for this temp table
-                base_table = temp_table.replace('_Temp', '')
-                # Find matching row in config_df
-                match = config_df[config_df['Target_Table'] == base_table]
-                if not match.empty:
-                    proj = match.iloc[0]['Target_Project_Id']
-                    ds = match.iloc[0]['Target_Dataset_Id']
-                    tbl = match.iloc[0]['Target_Table']
-                    temp_fqn = f"{proj}.{ds}.{tbl}_Temp"
-                    sql = f"SELECT * FROM `{temp_fqn}` LIMIT 5"
-                    df = client.query(sql).to_dataframe()
-                    st.markdown(f"**{temp_fqn}**")
-                    st.dataframe(df)
+                # Extract base table and source dataset from temp table name
+                if temp_table.endswith('_Temp'):
+                    # New logic: match by constructing temp table name from config
+                    # Removed debug/troubleshooting messages
+                    match = config_df[
+                        config_df.apply(
+                            lambda row: f"{row['Target_Table']}_{row['Source_Dataset_Id']}_Temp" == temp_table,
+                            axis=1
+                        )
+                    ]
+                    if not match.empty:
+                        proj = match.iloc[0]['Target_Project_Id']
+                        ds = match.iloc[0]['Target_Dataset_Id']
+                        temp_fqn = f"{proj}.{ds}.{temp_table}"
+                        sql = f"SELECT * FROM `{temp_fqn}` LIMIT 5"
+                        st.markdown(f"**{temp_fqn}**")
+                        st.code(sql, language="sql")
+                        df = client.query(sql).to_dataframe()
+                        st.dataframe(df)
+                    else:
+                        st.warning(f"Could not find config for temp table {temp_table}")
                 else:
-                    st.warning(f"Could not find config for temp table {temp_table}")
+                    st.warning(f"Temp table name does not end with _Temp: {temp_table}")
             except Exception as e:
                 st.error(f"Error fetching data from {temp_table}: {e}")
 
