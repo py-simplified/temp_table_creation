@@ -173,38 +173,43 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
         if dup_cols > 0:
             ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} has duplicate columns."})
             continue
-        # Build projection SQL for each column
+        # --- Reference JOIN planning ---
+        import re
+        ref_tables = group[group["Reference_Table"].notnull() & (group["Reference_Table"].str.lower() != "nan")]["Reference_Table"].drop_duplicates().tolist()
+        ref_pattern = "|".join([re.escape(str(r)) for r in ref_tables]) if ref_tables else ""
+        join_clauses = []
+        for _, ref in group[group["Reference_Table"].notnull() & (group["Reference_Table"].str.lower() != "nan") & group["Reference_Join_Key"].notnull() & group["Reference_Lookup_Column"].notnull()][["Reference_Table", "Reference_Join_Key", "Reference_Lookup_Column"]].drop_duplicates().iterrows():
+            ref_tbl = str(ref["Reference_Table"])
+            full_ref_fqn = f"{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{ref_tbl}"
+            join_clauses.append(
+                f"LEFT JOIN `{full_ref_fqn}` AS `{ref_tbl}` ON `{source['Source_Table']}`.`{ref['Reference_Lookup_Column']}` = `{ref_tbl}`.`{ref['Reference_Join_Key']}`"
+            )
+        join_sql = "\n".join(join_clauses)
+
+        # --- Build SELECT list with reference fixups ---
+        def fix_derivation(row):
+            logic = str(row["Derivation_Logic"])
+            ref_tbl = str(row["Reference_Table"])
+            if ref_tbl and ref_tbl.lower() != "nan" and ref_pattern:
+                logic = re.sub(r"\bref\.", f"{ref_tbl}.", logic)
+                logic = re.sub(rf"\b({ref_pattern})\.", f"{ref_tbl}.", logic)
+            return logic
+
         group_sorted = group.sort_values(["Scenario_ID", "Target_Column"])
-        projection = ",\n          ".join([
-            f"{row['Derivation_Logic']} AS `{str(row['Target_Column']).replace('`','')}`" for _, row in group_sorted.iterrows()
+        projection = ",\n  ".join([
+            f"{fix_derivation(row)} AS `{str(row['Target_Column']).replace('`','')}`" for _, row in group_sorted.iterrows()
         ])
         if not projection:
             ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} has no columns to select."})
             continue
 
-        # Reference JOIN planning
-        ref_rows = group[group["Reference_Table"].notnull() & group["Reference_Join_Key"].notnull() & group["Reference_Lookup_Column"].notnull()][["Reference_Table", "Reference_Join_Key", "Reference_Lookup_Column"]].drop_duplicates()
-        join_sqls = []
-        struct_sqls = []
-        for idx, ref in ref_rows.reset_index(drop=True).iterrows():
-            # Build FQN for reference table
-            ref_tbl = str(ref["Reference_Table"])
-            if "." in ref_tbl:
-                full_ref_fqn = ref_tbl
-            else:
-                full_ref_fqn = f"{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{ref_tbl}"
-            alias = f"ref{idx+1}"
-            join_sqls.append(
-                f"LEFT JOIN `{full_ref_fqn}` AS {alias} ON CAST({alias}.`{ref['Reference_Join_Key']}` AS STRING) = CAST(s.`{ref['Reference_Lookup_Column']}` AS STRING)"
-            )
-            struct_sqls.append(f", STRUCT({alias}.*) AS {alias}")
-
-        # Build final SQL for temp table (match stored procedure)
+        # --- Final CTAS SQL ---
         ctas = f"""
     CREATE OR REPLACE TABLE `{proj}.{ds}.{tbl}_Temp` AS
     SELECT
       {projection}
     FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
+    {join_sql}
     """
         ctas_sqls.append({"table": f"{tbl}_Temp", "sql": ctas.strip()})
     return ctas_sqls
