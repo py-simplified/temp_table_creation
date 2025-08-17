@@ -15,11 +15,14 @@ from google.cloud.bigquery import ScalarQueryParameter, ArrayQueryParameter
 # Configuration
 # -----------------------------
 # --- BigQuery configuration ---
-PROJECT_ID = "cohesive-apogee-411113"
-DATASET_ID = "banking_sample_data"
 TABLE_ID = "Validation_Scenarios"  # config table name
+
+st.sidebar.header("BigQuery Configuration")
+PROJECT_ID = st.sidebar.text_input("Project ID", value="project-id")
+DATASET_ID = st.sidebar.text_input("Dataset ID", value="dataset-id")
+PROC_NAME = st.sidebar.text_input("Stored Procedure Name", value="stored_procedure_name")
 TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-PROC_FQN = f"{PROJECT_ID}.{DATASET_ID}.build_temp_targets"
+PROC_FQN = f"{PROJECT_ID}.{DATASET_ID}.{PROC_NAME}"
 
 # Required columns for config table
 REQUIRED_COLS = [
