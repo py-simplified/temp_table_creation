@@ -1,7 +1,4 @@
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(
-  config_fqn STRING,
-  selected_targets ARRAY<STRING>
-)
+CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(config_fqn STRING, selected_targets ARRAY<STRING>)
 BEGIN
   -- 1) Stage valid config rows
   EXECUTE IMMEDIATE FORMAT("""
@@ -148,18 +145,18 @@ BEGIN
 
       -- 8) Execute CTAS
       EXECUTE IMMEDIATE FORMAT("""
-        CREATE OR REPLACE TABLE `%s.%s.%s_Temp` AS
-        SELECT
-          %s
-        FROM `%s.%s.%s` AS `%s`
+      CREATE OR REPLACE TABLE `%s.%s.%s_%s_Temp` AS
+      SELECT
         %s
-      """,
-        t.Target_Project_Id, t.Target_Dataset_Id, t.Target_Table,
-        select_list,
-        src_p, src_d, src_t,
-        src_t,
-        IFNULL(join_clauses, '')
-      );
+      FROM `%s.%s.%s` AS `%s`
+      %s
+    """,
+      t.Target_Project_Id, t.Target_Dataset_Id, t.Target_Table, src_d,  -- add src_d here
+      select_list,
+      src_p, src_d, src_t,
+      src_t,
+      IFNULL(join_clauses, '')
+    );
     END;
   END FOR;
 END;
