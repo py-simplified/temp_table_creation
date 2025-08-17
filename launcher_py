@@ -1,0 +1,16 @@
+import sys
+import os
+import subprocess
+
+# This launcher will run app.py using streamlit programmatically
+
+def main():
+    app_path = os.path.join(os.path.dirname(__file__), "app.py")
+    # Use sys.executable to ensure correct Python environment
+    args = [sys.executable, "-m", "streamlit", "run", app_path]
+    # Pass through any additional arguments
+    args.extend(sys.argv[1:])
+    subprocess.run(args)
+
+if __name__ == "__main__":
+    main()
