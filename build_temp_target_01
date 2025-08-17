@@ -1,0 +1,147 @@
+CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(
+  config_fqn STRING,
+  selected_targets ARRAY<STRING>
+)
+BEGIN
+  -- Step 1: Stage usable config rows
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE TEMP TABLE tmp_cfg AS
+    SELECT *
+    FROM `%s`
+    WHERE Target_Table IS NOT NULL
+      AND Target_Column IS NOT NULL
+      AND Derivation_Logic IS NOT NULL
+  """, config_fqn);
+
+  -- Step 2: Iterate over unique target tables
+  FOR t IN (
+    SELECT DISTINCT Target_Project_Id, Target_Dataset_Id, Target_Table
+    FROM tmp_cfg
+    WHERE ARRAY_LENGTH(selected_targets) = 0
+       OR Target_Table IN UNNEST(selected_targets)
+    ORDER BY Target_Project_Id, Target_Dataset_Id, Target_Table
+  )
+  DO
+    BEGIN
+      -- Declarations
+      DECLARE src STRUCT<p STRING, d STRING, t STRING>;
+      DECLARE ref STRUCT<t STRING>;
+      DECLARE ref_join_col STRING;
+      DECLARE src_lookup_col STRING;
+      DECLARE src_count INT64;
+      DECLARE dup_cols INT64;
+      DECLARE select_list STRING;
+      DECLARE join_clause STRING;
+      DECLARE ddl STRING;
+
+      -- Step 3: Extract source table
+      SET src = (
+        SELECT AS STRUCT
+          ANY_VALUE(Source_Project_Id) AS p,
+          ANY_VALUE(Source_Dataset_Id) AS d,
+          ANY_VALUE(Source_Table)      AS t
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table      = t.Target_Table
+      );
+
+      -- Step 4: Extract reference table name (assume same project/dataset as source)
+      SET ref = (
+        SELECT AS STRUCT
+          ANY_VALUE(Reference_Table) AS t
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table = t.Target_Table
+          AND Reference_Table IS NOT NULL
+      );
+
+      -- Step 5: Extract join keys
+      SET ref_join_col = (
+        SELECT ANY_VALUE(Reference_Join_Key)
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table = t.Target_Table
+          AND Reference_Join_Key IS NOT NULL
+      );
+
+      SET src_lookup_col = (
+        SELECT ANY_VALUE(Reference_Lookup_Column)
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table = t.Target_Table
+          AND Reference_Lookup_Column IS NOT NULL
+      );
+
+      -- Step 6: Validate one source table
+      SET src_count = (
+        SELECT COUNT(DISTINCT TO_JSON_STRING(STRUCT(Source_Project_Id, Source_Dataset_Id, Source_Table)))
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table = t.Target_Table
+      );
+      ASSERT src_count = 1 AS 'Each target must map to exactly one source table.';
+
+      -- Step 7: Check for duplicate columns
+      SET dup_cols = (
+        SELECT COUNT(1)
+        FROM (
+          SELECT Target_Column
+          FROM tmp_cfg
+          WHERE Target_Project_Id = t.Target_Project_Id
+            AND Target_Dataset_Id = t.Target_Dataset_Id
+            AND Target_Table = t.Target_Table
+          GROUP BY Target_Column
+          HAVING COUNT(*) > 1
+        )
+      );
+      ASSERT dup_cols = 0 AS 'Duplicate Target_Column entries found.';
+
+      -- Step 8: Construct SELECT clause (fix alias: reference_mapping → ref)
+      SET select_list = (
+        SELECT STRING_AGG(
+          FORMAT('%s AS `%s`',
+            REGEXP_REPLACE(Derivation_Logic, r'\breference_mapping\.', 'ref.'),  -- 🔁 alias fix
+            Target_Column
+          ),
+          ',\n  ' ORDER BY Scenario_ID, Target_Column
+        )
+        FROM tmp_cfg
+        WHERE Target_Project_Id = t.Target_Project_Id
+          AND Target_Dataset_Id = t.Target_Dataset_Id
+          AND Target_Table = t.Target_Table
+      );
+      ASSERT select_list IS NOT NULL AND LENGTH(select_list) > 0 AS 'No columns to select.';
+
+      -- Step 9: Construct LEFT JOIN if needed
+      SET join_clause = IF(ref.t IS NOT NULL AND ref_join_col IS NOT NULL AND src_lookup_col IS NOT NULL,
+        FORMAT('LEFT JOIN `%s.%s.%s` AS ref ON `%s`.`%s` = ref.`%s`',
+          src.p, src.d, ref.t,
+          src.t, src_lookup_col, ref_join_col
+        ),
+        ''
+      );
+
+      -- Step 10: Generate and execute final CTAS
+      SET ddl = FORMAT("""
+        CREATE OR REPLACE TABLE `%s.%s.%s_Temp` AS
+        SELECT
+          %s
+        FROM `%s.%s.%s` AS `%s`
+        %s
+      """,
+        t.Target_Project_Id, t.Target_Dataset_Id, t.Target_Table,
+        select_list,
+        src.p, src.d, src.t,
+        src.t,
+        join_clause
+      );
+
+      EXECUTE IMMEDIATE ddl;
+    END;
+  END FOR;
+END;
