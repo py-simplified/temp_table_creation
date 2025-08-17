@@ -104,9 +104,15 @@ def load_excel_to_bq(excel_bytes: bytes, mode: str):
 
     # Loads the uploaded Excel config into BigQuery
     client = get_bq_client()
-    # Read Excel file and canonicalize headers
-    df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=0, engine="openpyxl")
-    df = _canonicalize_headers(df)
+    # Read both worksheets
+    xls = pd.ExcelFile(io.BytesIO(excel_bytes), engine="openpyxl")
+    df_comp = xls.parse("Component_detail")
+    df_cfg = xls.parse("Temp_table_config")
+    # Canonicalize headers
+    df_comp = _canonicalize_headers(df_comp)
+    df_cfg = _canonicalize_headers(df_cfg)
+    # Left join on Component
+    df = pd.merge(df_cfg, df_comp, on="Component", how="left")
 
     # Check for missing required columns
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
