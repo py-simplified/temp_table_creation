@@ -1,7 +1,9 @@
+# Standard library imports
 import io
 import time
 from typing import List, Optional
 
+# Third-party imports
 import pandas as pd
 import streamlit as st
 from google.cloud import bigquery
@@ -12,12 +14,14 @@ from google.cloud.bigquery import ScalarQueryParameter, ArrayQueryParameter
 # -----------------------------
 # Configuration
 # -----------------------------
+# --- BigQuery configuration ---
 PROJECT_ID = "cohesive-apogee-411113"
 DATASET_ID = "banking_sample_data"
 TABLE_ID = "Validation_Scenarios"  # config table name
 TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 PROC_FQN = f"{PROJECT_ID}.{DATASET_ID}.build_temp_targets"
 
+# Required columns for config table
 REQUIRED_COLS = [
     "Source_Project_Id",
     "Source_Dataset_Id",
@@ -50,16 +54,22 @@ CANONICAL_MAP = {
 # -----------------------------
 # Helpers
 # -----------------------------
+
+# Returns a cached BigQuery client for efficient repeated queries
 @st.cache_resource(show_spinner=False)
 def get_bq_client():
     return bigquery.Client(project=PROJECT_ID)
 
 def _sanitize_col(col: str) -> str:
+
+    # Cleans up column names for consistent mapping
     s = col.strip().replace("\n", " ").replace("-", "_").replace(" ", "_")
     s = "_".join([p for p in s.split("_") if p])  # collapse repeats
     return s
 
 def _canonicalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+
+    # Maps DataFrame columns to canonical names using CANONICAL_MAP
     new_cols = []
     for c in df.columns:
         key = _sanitize_col(c).lower()
@@ -68,6 +78,8 @@ def _canonicalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def ensure_config_table(client: bigquery.Client, df: pd.DataFrame):
+
+    # Ensures the config table exists in BigQuery and has all required columns
     try:
         client.get_table(TABLE_FQN)
         table_exists = True
@@ -75,10 +87,12 @@ def ensure_config_table(client: bigquery.Client, df: pd.DataFrame):
         table_exists = False
 
     if not table_exists:
+        # Create table if it doesn't exist
         schema = [SchemaField(col, "STRING") for col in df.columns]
         table = bigquery.Table(TABLE_FQN, schema=schema)
         client.create_table(table)
     else:
+        # Add missing columns if table exists
         tbl = client.get_table(TABLE_FQN)
         existing_cols = {sch.name.lower() for sch in tbl.schema}
         to_add = [c for c in df.columns if c.lower() not in existing_cols]
@@ -87,16 +101,22 @@ def ensure_config_table(client: bigquery.Client, df: pd.DataFrame):
             client.query(ddl).result()
 
 def load_excel_to_bq(excel_bytes: bytes, mode: str):
+
+    # Loads the uploaded Excel config into BigQuery
     client = get_bq_client()
+    # Read Excel file and canonicalize headers
     df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=0, engine="openpyxl")
     df = _canonicalize_headers(df)
 
+    # Check for missing required columns
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    # Ensure config table exists and is up to date
     ensure_config_table(client, df)
 
+    # Set write mode for BigQuery load job
     job_config = LoadJobConfig()
     if mode == "Recreate (Full Refresh)":
         job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
@@ -105,22 +125,127 @@ def load_excel_to_bq(excel_bytes: bytes, mode: str):
     else:
         raise ValueError("Invalid load mode")
 
+    # Convert all columns to string for BigQuery
     for col in df.columns:
         df[col] = df[col].astype(str)
 
+    # Load DataFrame to BigQuery
     load_job = client.load_table_from_dataframe(df, TABLE_FQN, job_config=job_config)
     load_job.result()
 
 def list_components() -> List[str]:
+
+    # Returns a list of distinct target tables from the config table
     client = get_bq_client()
     sql = f"SELECT DISTINCT Target_Table FROM `{TABLE_FQN}` WHERE Target_Table IS NOT NULL ORDER BY Target_Table"
     rows = client.query(sql).result()
     return [row["Target_Table"] for row in rows]
 
 def preview_config(limit: int = 50) -> pd.DataFrame:
+
+    # Returns a preview of the config table as a DataFrame
     client = get_bq_client()
     sql = f"SELECT * FROM `{TABLE_FQN}` LIMIT {limit}"
     return client.query(sql).to_dataframe()
+
+# --- CTAS SQL Preview Helper ---
+def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[str]] = None) -> List[str]:
+
+    # Generates the SQL for creating temp tables for each selected target
+    ctas_sqls = []
+    if config_df.empty:
+        return ctas_sqls
+    # Filter targets based on selection
+    if selected_targets:
+        targets_df = config_df[config_df["Target_Table"].isin(selected_targets)]
+    else:
+        targets_df = config_df[config_df["Target_Table"].notnull()]
+    # Group by each target table
+    for (proj, ds, tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table"]):
+        # Guardrail #1: must map to exactly one source
+        sources = group[["Source_Project_Id", "Source_Dataset_Id", "Source_Table"]].drop_duplicates()
+        if len(sources) != 1:
+            ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} maps to {len(sources)} sources, expected 1."})
+            continue
+        source = sources.iloc[0]
+        # Guardrail #2: no duplicate target columns
+        dup_cols = group["Target_Column"].duplicated().sum()
+        if dup_cols > 0:
+            ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} has duplicate columns."})
+            continue
+        # Build projection SQL for each column
+        group_sorted = group.sort_values(["Scenario_ID", "Target_Column"])
+        projection = ",\n          ".join([
+            f"{row['Derivation_Logic']} AS `{str(row['Target_Column']).replace('`','')}`" for _, row in group_sorted.iterrows()
+        ])
+        if not projection:
+            ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} has no columns to select."})
+            continue
+
+        # Reference JOIN planning
+        ref_rows = group[group["Reference_Table"].notnull() & group["Reference_Join_Key"].notnull() & group["Reference_Lookup_Column"].notnull()][["Reference_Table", "Reference_Join_Key", "Reference_Lookup_Column"]].drop_duplicates()
+        join_sqls = []
+        struct_sqls = []
+        for idx, ref in ref_rows.reset_index(drop=True).iterrows():
+            # Build FQN for reference table
+            ref_tbl = str(ref["Reference_Table"])
+            if "." in ref_tbl:
+                full_ref_fqn = ref_tbl
+            else:
+                full_ref_fqn = f"{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{ref_tbl}"
+            alias = f"ref{idx+1}"
+            join_sqls.append(
+                f"LEFT JOIN `{full_ref_fqn}` AS {alias} ON CAST({alias}.`{ref['Reference_Join_Key']}` AS STRING) = CAST(s.`{ref['Reference_Lookup_Column']}` AS STRING)"
+            )
+            struct_sqls.append(f", STRUCT({alias}.*) AS {alias}")
+
+        # Build final SQL for temp table (match stored procedure)
+        ctas = f"""
+    CREATE OR REPLACE TABLE `{proj}.{ds}.{tbl}_Temp` AS
+    SELECT
+      {projection}
+    FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
+    """
+        ctas_sqls.append({"table": f"{tbl}_Temp", "sql": ctas.strip()})
+    return ctas_sqls
+
+    # --- CTAS SQL Preview Helper ---
+    def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[str]] = None) -> List[str]:
+        ctas_sqls = []
+        if config_df.empty:
+            return ctas_sqls
+        # Filter targets
+        if selected_targets:
+            targets_df = config_df[config_df["Target_Table"].isin(selected_targets)]
+        else:
+            targets_df = config_df[config_df["Target_Table"].notnull()]
+        # Group by target
+        for (proj, ds, tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table"]):
+            # Guardrail #1: must map to exactly one source
+            sources = group[["Source_Project_Id", "Source_Dataset_Id", "Source_Table"]].drop_duplicates()
+            if len(sources) != 1:
+                ctas_sqls.append(f"-- ERROR: Target {tbl} maps to {len(sources)} sources, expected 1.")
+                continue
+            source = sources.iloc[0]
+            # Guardrail #2: no duplicate target columns
+            dup_cols = group["Target_Column"].duplicated().sum()
+            if dup_cols > 0:
+                ctas_sqls.append(f"-- ERROR: Target {tbl} has duplicate columns.")
+                continue
+            # Build projection
+            group_sorted = group.sort_values(["Scenario_ID", "Target_Column"])
+            projection = ",\n  ".join([
+                f"{row['Derivation_Logic']} AS `{row['Target_Column']}" for _, row in group_sorted.iterrows()
+            ])
+            if not projection:
+                ctas_sqls.append(f"-- ERROR: Target {tbl} has no columns to select.")
+                continue
+            # Build CTAS
+            ctas = f"""
+    CREATE OR REPLACE TABLE `{proj}.{ds}.{tbl}_Temp` AS\nSELECT\n  {projection}\nFROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
+    """
+            ctas_sqls.append(ctas.strip())
+        return ctas_sqls
 
 def call_build_proc(selected: Optional[List[str]]):
     client = get_bq_client()
@@ -135,11 +260,15 @@ def call_build_proc(selected: Optional[List[str]]):
 # -----------------------------
 # UI
 # -----------------------------
+
+# --- Streamlit UI setup ---
 st.set_page_config(page_title="Validation Scenarios Manager", layout="wide")
 st.title("Validation Scenarios Manager")
 st.caption(f"Config table: `{TABLE_FQN}` · Procedure: `{PROC_FQN}`")
 
-with st.expander("1) Upload or Update Config (Excel → BigQuery)", expanded=True):
+with st.expander("1) Upload or Update Config (Excel → BigQuery)", expanded=False):
+
+    # Section 1: Upload Excel config to BigQuery
     uploaded = st.file_uploader("Upload Validation_Scenarios Excel (.xlsx)", type=["xlsx"])
     mode = st.radio("Upload mode", ["Recreate (Full Refresh)", "Append (Add New Rows)"], index=0, horizontal=True)
     if st.button("Upload to BigQuery", type="primary", disabled=uploaded is None):
@@ -153,7 +282,9 @@ with st.expander("1) Upload or Update Config (Excel → BigQuery)", expanded=Tru
             except Exception as e:
                 st.exception(e)
 
-with st.expander("2) Components Selection", expanded=True):
+with st.expander("2) Components Selection", expanded=False):
+
+    # Section 2: Select target tables and preview config
     try:
         components = list_components()
         select_all = st.checkbox("Select All", value=False)
@@ -170,7 +301,42 @@ with st.expander("2) Components Selection", expanded=True):
         st.info("Config table not found. Upload the Excel first.")
         selected = []
 
-with st.expander("3) Build Temp Tables", expanded=True):
+with st.expander("3) Build Temp Tables", expanded=False):
+
+
+    # Section 3: Preview SQL and run stored procedure
+    try:
+        # Preview the SQL that will be executed for each selected target
+        config_df = preview_config(1000)  # get all config rows
+        ctas_sqls = generate_ctas_sqls(config_df, selected)
+        st.subheader("Preview: Create Table As Select SQL for Selected Targets")
+        if ctas_sqls:
+            for item in ctas_sqls:
+                st.markdown(f"### Target Table: `{item['table']}`")
+                st.code(item['sql'], language="sql")
+        else:
+            st.info("No SQL to preview. Check your selection or config table.")
+    except Exception as e:
+        st.warning(f"Could not generate SQL preview: {e}")
+
+    # Show the stored procedure command that will be run
+    st.subheader("Stored Procedure Command to be Executed")
+    # Use markdown with code block for better wrapping and scrollability
+    if selected:
+        targets_str = ', '.join([f"'{t}'" for t in selected])
+        targets_array = f"[{targets_str}]"
+    else:
+        targets_array = "NULL"
+    proc_cmd = f"CALL `{PROC_FQN}`('{TABLE_FQN}', {targets_array});"
+    st.markdown(f"""
+<div style='overflow-x:auto; background:#f8f9fa; border-radius:8px; padding:8px;'>
+<pre style='white-space:pre-wrap; word-break:break-all;'>
+{proc_cmd}
+</pre>
+</div>
+""", unsafe_allow_html=True)
+
+    # Button to run the stored procedure
     if st.button("Run Stored Procedure", type="primary"):
         try:
             start = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -178,10 +344,11 @@ with st.expander("3) Build Temp Tables", expanded=True):
                 call_build_proc(selected)
             end = time.strftime("%Y-%m-%d %H:%M:%S")
             st.success(f"Completed. Started: {start} · Finished: {end}")
-            st.code(f"CALL `{PROC_FQN}`('{TABLE_FQN}', {selected if selected else 'NULL'});")
+            st.code(proc_cmd, language="sql")
         except Exception as e:
             st.exception(e)
 
+
+# Footer note for authentication
 st.divider()
 st.caption("Note: Uses Application Default Credentials. Locally: `gcloud auth application-default login`.")
-
