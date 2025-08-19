@@ -169,18 +169,18 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
         targets_df = config_df[config_df["Target_Table"].isin(selected_targets)]
     else:
         targets_df = config_df[config_df["Target_Table"].notnull()]
-    # Group by each target table
-    for (proj, ds, tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table"]):
-        # Guardrail #1: must map to exactly one source
+    # Group by each target+source combination (allows same target table from different source datasets)
+    for (proj, ds, tbl, src_proj, src_ds, src_tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table", "Source_Project_Id", "Source_Dataset_Id", "Source_Table"]):
+        # Guardrail #1: within this target+source combination, should have exactly one source (already guaranteed by groupby)
         sources = group[["Source_Project_Id", "Source_Dataset_Id", "Source_Table"]].drop_duplicates()
         if len(sources) != 1:
-            ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} maps to {len(sources)} sources, expected 1."})
+            ctas_sqls.append({"table": f"{tbl}_{src_ds}", "sql": f"-- ERROR: Target {tbl} from {src_ds} maps to {len(sources)} sources, expected 1."})
             continue
         source = sources.iloc[0]
-        # Guardrail #2: no duplicate target columns
+        # Guardrail #2: no duplicate target columns within this target+source combination
         dup_cols = group["Target_Column"].duplicated().sum()
         if dup_cols > 0:
-            ctas_sqls.append({"table": tbl, "sql": f"-- ERROR: Target {tbl} has duplicate columns."})
+            ctas_sqls.append({"table": f"{tbl}_{src_ds}", "sql": f"-- ERROR: Target {tbl} from {src_ds} has duplicate columns."})
             continue
         # --- Reference JOIN planning ---
         import re
@@ -264,18 +264,18 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
             targets_df = config_df[config_df["Target_Table"].isin(selected_targets)]
         else:
             targets_df = config_df[config_df["Target_Table"].notnull()]
-        # Group by target
-        for (proj, ds, tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table"]):
-            # Guardrail #1: must map to exactly one source
+        # Group by target+source combination (allows same target table from different source datasets)
+        for (proj, ds, tbl, src_proj, src_ds, src_tbl), group in targets_df.groupby(["Target_Project_Id", "Target_Dataset_Id", "Target_Table", "Source_Project_Id", "Source_Dataset_Id", "Source_Table"]):
+            # Guardrail #1: within this target+source combination, should have exactly one source (already guaranteed by groupby)
             sources = group[["Source_Project_Id", "Source_Dataset_Id", "Source_Table"]].drop_duplicates()
             if len(sources) != 1:
-                ctas_sqls.append(f"-- ERROR: Target {tbl} maps to {len(sources)} sources, expected 1.")
+                ctas_sqls.append(f"-- ERROR: Target {tbl} from {src_ds} maps to {len(sources)} sources, expected 1.")
                 continue
             source = sources.iloc[0]
-            # Guardrail #2: no duplicate target columns
+            # Guardrail #2: no duplicate target columns within this target+source combination
             dup_cols = group["Target_Column"].duplicated().sum()
             if dup_cols > 0:
-                ctas_sqls.append(f"-- ERROR: Target {tbl} has duplicate columns.")
+                ctas_sqls.append(f"-- ERROR: Target {tbl} from {src_ds} has duplicate columns.")
                 continue
             # Build projection
             group_sorted = group.sort_values(["Scenario_ID", "Target_Column"])
@@ -283,11 +283,15 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
                 f"{row['Derivation_Logic']} AS `{row['Target_Column']}" for _, row in group_sorted.iterrows()
             ])
             if not projection:
-                ctas_sqls.append(f"-- ERROR: Target {tbl} has no columns to select.")
+                ctas_sqls.append(f"-- ERROR: Target {tbl} from {src_ds} has no columns to select.")
                 continue
-            # Build CTAS
+            # Build CTAS with source dataset in table name
+            temp_table_name = f"{tbl}_{source['Source_Dataset_Id']}_Temp"
             ctas = f"""
-    CREATE OR REPLACE TABLE `{proj}.{ds}.{tbl}_Temp` AS\nSELECT\n  {projection}\nFROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
+    CREATE OR REPLACE TABLE `{proj}.{ds}.{temp_table_name}` AS
+SELECT
+  {projection}
+FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
     """
             ctas_sqls.append(ctas.strip())
         return ctas_sqls
