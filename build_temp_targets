@@ -88,17 +88,17 @@ BEGIN
       SET has_refs = (ref_pattern IS NOT NULL AND LENGTH(ref_pattern) > 0);
 
       IF has_refs THEN
-        -- Build one LEFT JOIN per distinct valid reference table; alias = table name
-        SET join_clauses = (
-          SELECT STRING_AGG(
-                   FORMAT(
-                     'LEFT JOIN `%s.%s.%s` AS `%s` ON `%s`.`%s` = `%s`.`%s`',
-                     src_p, src_d, Reference_Table, Reference_Table,
-                     src_t, Reference_Lookup_Column,
-                     Reference_Table, Reference_Join_Key
-                   ),
-                   '\n'
-                 )
+        -- First, create a temp table with unique aliases for reference tables
+        CREATE OR REPLACE TEMP TABLE ref_aliases AS (
+          SELECT 
+            Reference_Table,
+            Reference_Join_Key, 
+            Reference_Lookup_Column,
+            CASE 
+              WHEN ROW_NUMBER() OVER (PARTITION BY Reference_Table ORDER BY Reference_Join_Key, Reference_Lookup_Column) = 1 
+              THEN Reference_Table
+              ELSE CONCAT(Reference_Table, '_', CAST(ROW_NUMBER() OVER (PARTITION BY Reference_Table ORDER BY Reference_Join_Key, Reference_Lookup_Column) AS STRING))
+            END AS alias_name
           FROM (
             SELECT DISTINCT Reference_Table, Reference_Join_Key, Reference_Lookup_Column
             FROM tmp_cfg
@@ -111,35 +111,53 @@ BEGIN
               AND Reference_Lookup_Column IS NOT NULL
           )
         );
+
+        -- Build one LEFT JOIN per distinct combination using the pre-computed aliases
+        SET join_clauses = (
+          SELECT STRING_AGG(
+                   FORMAT(
+                     'LEFT JOIN `%s.%s.%s` AS `%s` ON `%s`.`%s` = `%s`.`%s`',
+                     src_p, src_d, Reference_Table, 
+                     alias_name,
+                     src_t, Reference_Lookup_Column,
+                     alias_name, 
+                     Reference_Join_Key
+                   ),
+                   '\n'
+                 )
+          FROM ref_aliases
+        );
       END IF;
 
       -- 7) Build SELECT list, row-by-row fixups:
       --    If a row has a Reference_Table, rewrite any leading reference-table prefix
-      --    (or generic 'ref.') to that specific Reference_Table.
+      --    (or generic 'ref.') to that specific Reference_Table with correct unique alias.
       SET select_list = (
         SELECT STRING_AGG(
                  FORMAT('%s AS `%s`',
                    CASE
-                     WHEN Reference_Table IS NOT NULL AND LOWER(Reference_Table) != 'nan' THEN
-                       -- First, if expression uses any known ref-table prefix, rewrite it to THIS row's Reference_Table
+                     WHEN cfg.Reference_Table IS NOT NULL AND LOWER(cfg.Reference_Table) != 'nan' THEN
+                       -- Get the correct alias for this specific reference combination and apply it
                        REGEXP_REPLACE(
-                         -- Also rewrite a generic 'ref.' prefix if someone used it in config
-                         REGEXP_REPLACE(Derivation_Logic,
-                                        r'\bref\.', CONCAT(Reference_Table, '.')),
-                         CONCAT('\\b(', ref_pattern, ')\\.'),
-                         CONCAT(Reference_Table, '.')
+                         REGEXP_REPLACE(cfg.Derivation_Logic,
+                                        r'\bref\.', CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')),
+                         CONCAT('\\b', cfg.Reference_Table, '\\.'),
+                         CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')
                        )
                      ELSE
-                       Derivation_Logic
+                       cfg.Derivation_Logic
                    END,
-                   Target_Column
+                   cfg.Target_Column
                  ),
-                 ',\n  ' ORDER BY Scenario_ID, Target_Column
+                 ',\n  ' ORDER BY cfg.Scenario_ID, cfg.Target_Column
                )
-        FROM tmp_cfg
-        WHERE Target_Project_Id = t.Target_Project_Id
-          AND Target_Dataset_Id = t.Target_Dataset_Id
-          AND Target_Table      = t.Target_Table
+        FROM tmp_cfg cfg
+        LEFT JOIN ref_aliases ra ON cfg.Reference_Table = ra.Reference_Table 
+                                  AND cfg.Reference_Join_Key = ra.Reference_Join_Key
+                                  AND cfg.Reference_Lookup_Column = ra.Reference_Lookup_Column
+        WHERE cfg.Target_Project_Id = t.Target_Project_Id
+          AND cfg.Target_Dataset_Id = t.Target_Dataset_Id
+          AND cfg.Target_Table      = t.Target_Table
       );
       ASSERT select_list IS NOT NULL AND LENGTH(select_list) > 0 AS 'No columns to select for this target.';
 
