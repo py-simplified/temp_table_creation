@@ -187,11 +187,33 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
         ref_tables = group[group["Reference_Table"].notnull() & (group["Reference_Table"].str.lower() != "nan")]["Reference_Table"].drop_duplicates().tolist()
         ref_pattern = "|".join([re.escape(str(r)) for r in ref_tables]) if ref_tables else ""
         join_clauses = []
-        for _, ref in group[group["Reference_Table"].notnull() & (group["Reference_Table"].str.lower() != "nan") & group["Reference_Join_Key"].notnull() & group["Reference_Lookup_Column"].notnull()][["Reference_Table", "Reference_Join_Key", "Reference_Lookup_Column"]].drop_duplicates().iterrows():
+        ref_alias_counter = {}  # Track aliases for each reference table to ensure uniqueness
+        
+        # Create a mapping from (ref_table, join_key, lookup_col) to unique alias
+        ref_combinations = group[group["Reference_Table"].notnull() & (group["Reference_Table"].str.lower() != "nan") & group["Reference_Join_Key"].notnull() & group["Reference_Lookup_Column"].notnull()][["Reference_Table", "Reference_Join_Key", "Reference_Lookup_Column"]].drop_duplicates()
+        ref_alias_map = {}
+        
+        for _, ref in ref_combinations.iterrows():
             ref_tbl = str(ref["Reference_Table"])
+            join_key = str(ref["Reference_Join_Key"])
+            lookup_col = str(ref["Reference_Lookup_Column"])
+            
+            # Create unique alias for this combination
+            if ref_tbl not in ref_alias_counter:
+                ref_alias_counter[ref_tbl] = 0
+            ref_alias_counter[ref_tbl] += 1
+            
+            if ref_alias_counter[ref_tbl] == 1:
+                alias = ref_tbl  # First occurrence uses table name as alias
+            else:
+                alias = f"{ref_tbl}_{ref_alias_counter[ref_tbl]}"  # Subsequent uses numbered alias
+            
+            # Store mapping for later use in derivation logic
+            ref_alias_map[(ref_tbl, join_key, lookup_col)] = alias
+            
             full_ref_fqn = f"{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{ref_tbl}"
             join_clauses.append(
-                f"LEFT JOIN `{full_ref_fqn}` AS `{ref_tbl}` ON `{source['Source_Table']}`.`{ref['Reference_Lookup_Column']}` = `{ref_tbl}`.`{ref['Reference_Join_Key']}`"
+                f"LEFT JOIN `{full_ref_fqn}` AS `{alias}` ON `{source['Source_Table']}`.`{lookup_col}` = `{alias}`.`{join_key}`"
             )
         join_sql = "\n".join(join_clauses)
 
@@ -199,9 +221,16 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
         def fix_derivation(row):
             logic = str(row["Derivation_Logic"])
             ref_tbl = str(row["Reference_Table"])
+            ref_join_key = str(row["Reference_Join_Key"])
+            ref_lookup_col = str(row["Reference_Lookup_Column"])
+            
             if ref_tbl and ref_tbl.lower() != "nan" and ref_pattern:
-                logic = re.sub(r"\bref\.", f"{ref_tbl}.", logic)
-                logic = re.sub(rf"\b({ref_pattern})\.", f"{ref_tbl}.", logic)
+                # Find the correct alias for this specific reference combination
+                alias_key = (ref_tbl, ref_join_key, ref_lookup_col)
+                if alias_key in ref_alias_map:
+                    correct_alias = ref_alias_map[alias_key]
+                    logic = re.sub(r"\bref\.", f"{correct_alias}.", logic)
+                    logic = re.sub(rf"\b{re.escape(ref_tbl)}\.", f"{correct_alias}.", logic)
             return logic
 
         group_sorted = group.sort_values(["Scenario_ID", "Target_Column"])
@@ -298,6 +327,9 @@ with st.expander("1) Upload or Update Config (Excel → BigQuery)", expanded=Fal
             except Exception as e:
                 st.exception(e)
 
+# Initialize selected as empty list
+selected = []
+
 with st.expander("2) Components Selection", expanded=False):
 
     # Section 2: Select target tables and preview config
@@ -317,10 +349,9 @@ with st.expander("2) Components Selection", expanded=False):
         st.info("Config table not found. Upload the Excel first.")
         selected = []
 
-with st.expander("3) Build Temp Tables", expanded=False):
-
-
-    # Section 3: Preview SQL and run stored procedure
+# --- Review Temp Table SQLs expander (before Execute) ---
+with st.expander("3) Review Temp Table SQLs", expanded=False):
+    # Section 3: Preview SQL only
     try:
         # Preview the SQL that will be executed for each selected target
         config_df = preview_config(1000)  # get all config rows
@@ -335,16 +366,14 @@ with st.expander("3) Build Temp Tables", expanded=False):
     except Exception as e:
         st.warning(f"Could not generate SQL preview: {e}")
 
-    # Show the stored procedure command that will be run
-    st.subheader("Stored Procedure Command to be Executed")
-    # Use markdown with code block for better wrapping and scrollability
-    if selected:
+# --- Stored procedure expander: expanded only if components are selected ---
+with st.expander("4) Execute Stored Procedure", expanded=bool(selected and len(selected) > 0)):
+    if selected and len(selected) > 0:
+        st.subheader("Stored Procedure Command to be Executed")
         targets_str = ', '.join([f"'{t}'" for t in selected])
         targets_array = f"[{targets_str}]"
-    else:
-        targets_array = "NULL"
-    proc_cmd = f"CALL `{PROC_FQN}`('{TABLE_FQN}', {targets_array});"
-    st.markdown(f"""
+        proc_cmd = f"CALL `{PROC_FQN}`('{TABLE_FQN}', {targets_array});"
+        st.markdown(f"""
 <div style='overflow-x:auto; background:#f8f9fa; border-radius:8px; padding:8px;'>
 <pre style='white-space:pre-wrap; word-break:break-all;'>
 {proc_cmd}
@@ -352,17 +381,18 @@ with st.expander("3) Build Temp Tables", expanded=False):
 </div>
 """, unsafe_allow_html=True)
 
-    # Button to run the stored procedure
-    if st.button("Run Stored Procedure", type="primary"):
-        try:
-            start = time.strftime("%Y-%m-%d %H:%M:%S")
-            with st.spinner("Running stored procedure..."):
-                call_build_proc(selected)
-            end = time.strftime("%Y-%m-%d %H:%M:%S")
-            st.success(f"Completed. Started: {start} · Finished: {end}")
-            st.code(proc_cmd, language="sql")
-        except Exception as e:
-            st.exception(e)
+        if st.button("Run Stored Procedure", type="primary"):
+            try:
+                start = time.strftime("%Y-%m-%d %H:%M:%S")
+                with st.spinner("Running stored procedure..."):
+                    call_build_proc(selected)
+                end = time.strftime("%Y-%m-%d %H:%M:%S")
+                st.success(f"Completed. Started: {start} · Finished: {end}")
+                st.code(proc_cmd, language="sql")
+            except Exception as e:
+                st.exception(e)
+    else:
+        st.info("Please select at least one component from the Components Selection section above.")
 
 # --- New expander for sample data preview ---
 show_data = st.checkbox("Show 5 rows from each created temp table (after procedure run)")
