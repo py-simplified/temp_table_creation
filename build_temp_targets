@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.banking_sample_data.build_temp_targets`(config_fqn STRING, selected_targets ARRAY<STRING>)
+CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.My_Results.build_temp_targets`(config_fqn STRING, selected_targets ARRAY<STRING>)
 BEGIN
   -- 1) Stage valid config rows
   EXECUTE IMMEDIATE FORMAT("""
