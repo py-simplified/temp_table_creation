@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Step 1: Create virtual environment
+python -m venv launcher_env
+
+# Step 2: Activate virtual environment
+source launcher_env/Scripts/activate
+
+# Step 3: Upgrade pip
+pip install --upgrade pip
+
+# Step 4: Install required libraries
+pip install -r requirements.txt
+
+# Step 5: Install PyInstaller if not already present
+pip install pyinstaller
+
+# Step 6: Build the executable for launcher.py with hidden imports
+pyinstaller --onefile launcher.py \
+  --hidden-import=altair \
+  --hidden-import=streamlit \
+  --hidden-import=pandas \
+  --hidden-import=google.cloud \
+  --hidden-import=openpyxl
+
+echo "Executable created in the dist/ directory."
