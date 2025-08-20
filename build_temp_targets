@@ -10,13 +10,15 @@ BEGIN
       AND Derivation_Logic  IS NOT NULL
   """, config_fqn);
 
-  -- 2) Iterate targets
+  -- 2) Iterate unique target+source combinations
   FOR t IN (
-    SELECT DISTINCT Target_Project_Id, Target_Dataset_Id, Target_Table
+    SELECT DISTINCT 
+      Target_Project_Id, Target_Dataset_Id, Target_Table,
+      Source_Project_Id, Source_Dataset_Id, Source_Table
     FROM tmp_cfg
     WHERE ARRAY_LENGTH(selected_targets) = 0
        OR Target_Table IN UNNEST(selected_targets)
-    ORDER BY Target_Project_Id, Target_Dataset_Id, Target_Table
+    ORDER BY Target_Project_Id, Target_Dataset_Id, Target_Table, Source_Dataset_Id
   ) DO
     BEGIN
       -- Declarations (must be at top)
@@ -30,29 +32,24 @@ BEGIN
       DECLARE ref_pattern STRING;          -- dynamic alternation: e.g. "reference_mapping|reference_mapping_01"
       DECLARE has_refs BOOL;
 
-      -- 3) Get single source triple
-      SET (src_p, src_d, src_t) = (
-        SELECT AS STRUCT
-          ANY_VALUE(Source_Project_Id),
-          ANY_VALUE(Source_Dataset_Id),
-          ANY_VALUE(Source_Table)
-        FROM tmp_cfg
-        WHERE Target_Project_Id = t.Target_Project_Id
-          AND Target_Dataset_Id = t.Target_Dataset_Id
-          AND Target_Table      = t.Target_Table
-      );
+      -- 3) Get source info directly from iterator (already validated by DISTINCT)
+      SET src_p = t.Source_Project_Id;
+      SET src_d = t.Source_Dataset_Id;
+      SET src_t = t.Source_Table;
 
-      -- 4) Validate exactly one source
+      -- 4) Validate exactly one source per target+source_dataset combination
+      -- Note: Multiple source datasets for same target table is allowed - they create separate temp tables
       SET src_count = (
         SELECT COUNT(DISTINCT TO_JSON_STRING(STRUCT(Source_Project_Id, Source_Dataset_Id, Source_Table)))
         FROM tmp_cfg
         WHERE Target_Project_Id = t.Target_Project_Id
           AND Target_Dataset_Id = t.Target_Dataset_Id
           AND Target_Table      = t.Target_Table
+          AND Source_Dataset_Id = t.Source_Dataset_Id  -- Group by specific source dataset
       );
-      ASSERT src_count = 1 AS 'Each target must map to exactly one source table (Project/Dataset/Table).';
+      ASSERT src_count = 1 AS 'Each target+source_dataset combination must map to exactly one source table.';
 
-      -- 5) No duplicate target columns
+      -- 5) No duplicate target columns within this specific target+source combination
       SET dup_cols = (
         SELECT COUNT(*)
         FROM (
@@ -61,11 +58,12 @@ BEGIN
           WHERE Target_Project_Id = t.Target_Project_Id
             AND Target_Dataset_Id = t.Target_Dataset_Id
             AND Target_Table      = t.Target_Table
+            AND Source_Dataset_Id = t.Source_Dataset_Id  -- Scope to specific source dataset
           GROUP BY Target_Column
           HAVING COUNT(*) > 1
         )
       );
-      ASSERT dup_cols = 0 AS 'Duplicate Target_Column entries found for this target.';
+      ASSERT dup_cols = 0 AS 'Duplicate Target_Column entries found for this target+source combination.';
 
       -- 6) Build dynamic reference table pattern (escaped, OR-joined), and join clauses
       SET ref_pattern = (
@@ -80,6 +78,7 @@ BEGIN
           WHERE Target_Project_Id = t.Target_Project_Id
             AND Target_Dataset_Id = t.Target_Dataset_Id
             AND Target_Table      = t.Target_Table
+            AND Source_Dataset_Id = t.Source_Dataset_Id  -- Include source dataset filter
             AND Reference_Table IS NOT NULL
             AND LOWER(Reference_Table) != 'nan'
         )
@@ -105,6 +104,7 @@ BEGIN
             WHERE Target_Project_Id = t.Target_Project_Id
               AND Target_Dataset_Id = t.Target_Dataset_Id
               AND Target_Table      = t.Target_Table
+              AND Source_Dataset_Id = t.Source_Dataset_Id  -- Include source dataset filter
               AND Reference_Table IS NOT NULL
               AND LOWER(Reference_Table) != 'nan'
               AND Reference_Join_Key IS NOT NULL
@@ -132,33 +132,51 @@ BEGIN
       -- 7) Build SELECT list, row-by-row fixups:
       --    If a row has a Reference_Table, rewrite any leading reference-table prefix
       --    (or generic 'ref.') to that specific Reference_Table with correct unique alias.
-      SET select_list = (
-        SELECT STRING_AGG(
-                 FORMAT('%s AS `%s`',
-                   CASE
-                     WHEN cfg.Reference_Table IS NOT NULL AND LOWER(cfg.Reference_Table) != 'nan' THEN
-                       -- Get the correct alias for this specific reference combination and apply it
-                       REGEXP_REPLACE(
-                         REGEXP_REPLACE(cfg.Derivation_Logic,
-                                        r'\bref\.', CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')),
-                         CONCAT('\\b', cfg.Reference_Table, '\\.'),
-                         CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')
-                       )
-                     ELSE
-                       cfg.Derivation_Logic
-                   END,
-                   cfg.Target_Column
-                 ),
-                 ',\n  ' ORDER BY cfg.Scenario_ID, cfg.Target_Column
-               )
-        FROM tmp_cfg cfg
-        LEFT JOIN ref_aliases ra ON cfg.Reference_Table = ra.Reference_Table 
-                                  AND cfg.Reference_Join_Key = ra.Reference_Join_Key
-                                  AND cfg.Reference_Lookup_Column = ra.Reference_Lookup_Column
-        WHERE cfg.Target_Project_Id = t.Target_Project_Id
-          AND cfg.Target_Dataset_Id = t.Target_Dataset_Id
-          AND cfg.Target_Table      = t.Target_Table
-      );
+      IF has_refs THEN
+        SET select_list = (
+          SELECT STRING_AGG(
+                   FORMAT('%s AS `%s`',
+                     CASE
+                       WHEN cfg.Reference_Table IS NOT NULL AND LOWER(cfg.Reference_Table) != 'nan' THEN
+                         -- Get the correct alias for this specific reference combination and apply it
+                         REGEXP_REPLACE(
+                           REGEXP_REPLACE(cfg.Derivation_Logic,
+                                          r'\bref\.', CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')),
+                           CONCAT('\\b', cfg.Reference_Table, '\\.'),
+                           CONCAT(COALESCE(ra.alias_name, cfg.Reference_Table), '.')
+                         )
+                       ELSE
+                         cfg.Derivation_Logic
+                     END,
+                     cfg.Target_Column
+                   ),
+                   ',\n  ' ORDER BY cfg.Scenario_ID, cfg.Target_Column
+                 )
+          FROM tmp_cfg cfg
+          LEFT JOIN ref_aliases ra ON cfg.Reference_Table = ra.Reference_Table 
+                                    AND cfg.Reference_Join_Key = ra.Reference_Join_Key
+                                    AND cfg.Reference_Lookup_Column = ra.Reference_Lookup_Column
+          WHERE cfg.Target_Project_Id = t.Target_Project_Id
+            AND cfg.Target_Dataset_Id = t.Target_Dataset_Id
+            AND cfg.Target_Table      = t.Target_Table
+            AND cfg.Source_Dataset_Id = t.Source_Dataset_Id  -- Include source dataset filter
+        );
+      ELSE
+        SET select_list = (
+          SELECT STRING_AGG(
+                   FORMAT('%s AS `%s`',
+                     cfg.Derivation_Logic,
+                     cfg.Target_Column
+                   ),
+                   ',\n  ' ORDER BY cfg.Scenario_ID, cfg.Target_Column
+                 )
+          FROM tmp_cfg cfg
+          WHERE cfg.Target_Project_Id = t.Target_Project_Id
+            AND cfg.Target_Dataset_Id = t.Target_Dataset_Id
+            AND cfg.Target_Table      = t.Target_Table
+            AND cfg.Source_Dataset_Id = t.Source_Dataset_Id
+        );
+      END IF;
       ASSERT select_list IS NOT NULL AND LENGTH(select_list) > 0 AS 'No columns to select for this target.';
 
       -- 8) Execute CTAS
