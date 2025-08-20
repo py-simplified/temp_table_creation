@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Set the path to the base Python executable here
+# Use global python from PATH
+BASE_PYTHON="python"
+echo "Using global Python from PATH: $BASE_PYTHON"
+
+# Set venv and script paths for Windows
+VENV_DIR="launcher_env"
+VENV_ACTIVATE="$VENV_DIR\\Scripts\\activate"
+VENV_PYTHON="$VENV_DIR\\Scripts\\python.exe"
+
+# Step 1: Create virtual environment
+echo "[1/7] Creating Python virtual environment (launcher_env) using $BASE_PYTHON..."
+$BASE_PYTHON -m venv $VENV_DIR
+if [ ! -f "$VENV_PYTHON" ]; then
+  echo "ERROR: Virtual environment was not created successfully. Check your BASE_PYTHON path and permissions."
+  exit 1
+fi
+
+# Step 2: Activate virtual environment
+echo "[2/7] Activating virtual environment..."
+source "$VENV_ACTIVATE"
+
+# Step 3: Upgrade pip
+echo "[3/7] Upgrading pip..."
+$VENV_PYTHON -m pip install --upgrade pip || {
+  echo "ERROR: Could not upgrade pip. This is often a permissions issue on Windows."
+  echo "Try deleting the launcher_env folder and re-running this script."
+  echo "If you see '[WinError 5] Access is denied', ensure you are not running as Administrator and that your user has write permissions."
+  echo "If the error persists, try running the script from a different directory or check your antivirus settings."
+  exit 1
+}
+
+# Step 4: Install required libraries
+echo "[4/7] Installing required libraries from requirements.txt..."
+$VENV_PYTHON -m pip install -r requirements.txt || {
+  echo "ERROR: Could not install packages from requirements.txt. This is often a permissions issue on Windows."
+  echo "Try deleting the launcher_env folder and re-running this script."
+  echo "If you see '[WinError 5] Access is denied', ensure you are not running as Administrator and that your user has write permissions."
+  echo "If the error persists, try running the script from a different directory or check your antivirus settings."
+  exit 1
+}
+
+# Step 5: Install PyInstaller if not already present
+echo "[5/7] Installing PyInstaller..."
+$VENV_PYTHON -m pip install pyinstaller || {
+  echo "ERROR: Could not install PyInstaller. This is often a permissions issue on Windows."
+  echo "Try deleting the launcher_env folder and re-running this script."
+  echo "If you see '[WinError 5] Access is denied', ensure you are not running as Administrator and that your user has write permissions."
+  echo "If the error persists, try running the script from a different directory or check your antivirus settings."
+  exit 1
+}
+
+# Step 6: Build the executable for launcher.py with hidden imports
+echo "[6/7] Building launcher.exe with PyInstaller (including hidden imports)..."
+$VENV_PYTHON -m pyinstaller --onefile launcher.py \
+  --hidden-import=altair \
+  --hidden-import=streamlit \
+  --hidden-import=pandas \
+  --hidden-import=google.cloud \
+  --hidden-import=openpyxl
+
+# Step 7: Done
+echo "[7/7] Build complete! Executable created in the dist/ directory."
