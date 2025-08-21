@@ -511,7 +511,7 @@ with tabs[1]:
             st.session_state.raft_components = []
         
         if load_components:
-            client = get_bq_client()
+            client = get_bq_client(RAFT_PROJECT_ID)
             raft_master_table = f"{RAFT_PROJECT_ID}.{RAFT_DATASET_ID}.RAFT_MASTER_CONFIG"
             try:
                 df_master = client.query(f"SELECT Component FROM `{raft_master_table}`").to_dataframe()
