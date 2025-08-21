@@ -557,16 +557,15 @@ with tabs[1]:
             
             # Handle "Select All" column logic
             if edited_df is not None and "Select All" in edited_df.columns:
-                # Check if any "Select All" checkbox was changed
-                for idx, component in enumerate(components):
-                    if edited_df.loc[component, "Select All"]:
-                        # If "Select All" is checked for this row, check all procedure columns
+                # If Select All checkbox (above table) is checked, update all checkboxes and rerun
+                if select_all:
+                    for component in components:
                         for proc in raft_procs:
                             edited_df.loc[component, proc] = True
-                    
-                # Update the data editor with the changes
-                if not edited_df.equals(df_editor):
+                        edited_df.loc[component, "Select All"] = True
                     st.rerun()
+                # If individual checkboxes are used, do not rerun, just use edited_df as is    
+                #                 
         elif load_components:
             st.info("No components found in RAFT_MASTER_CONFIG table.")
         else:
@@ -582,7 +581,17 @@ with tabs[1]:
                     component_calls = []
                     for proc in raft_procs:
                         if proc in edited_df.columns and edited_df.loc[component, proc]:
-                            call_cmd = f"CALL `{RAFT_PROJECT_ID}.{RAFT_DATASET_ID}.{proc}`('{component}');"
+                            # Determine argument list based on procedure name
+                            quoted_component = f'"{component}"'
+                            if proc == "RAFT_REFDATA_CMPR_SP" or proc == "RAFT_METADATA_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""'])
+                            elif proc == "RAFT_DATA_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""', '""', '""'])
+                            elif proc == "RAFT_AGG_BAL_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""', '""'])
+                            else:
+                                args = quoted_component
+                            call_cmd = f"CALL `{RAFT_PROJECT_ID}.{RAFT_DATASET_ID}.{proc}`({args});"
                             component_calls.append(call_cmd)
                     if component_calls:
                         call_commands.append({
@@ -613,7 +622,16 @@ with tabs[1]:
                 for component in edited_df.index:
                     for proc in raft_procs:
                         if proc in edited_df.columns and edited_df.loc[component, proc]:
-                            call_cmd = f"CALL `{RAFT_PROJECT_ID}.{RAFT_DATASET_ID}.{proc}`('{component}')"
+                            quoted_component = f'"{component}"'
+                            if proc == "RAFT_REFDATA_CMPR_SP" or proc == "RAFT_METADATA_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""'])
+                            elif proc == "RAFT_DATA_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""', '""', '""'])
+                            elif proc == "RAFT_AGG_BAL_CMPR_SP":
+                                args = ', '.join([quoted_component, '""', '""', '""'])
+                            else:
+                                args = quoted_component
+                            call_cmd = f"CALL `{RAFT_PROJECT_ID}.{RAFT_DATASET_ID}.{proc}`({args})"
                             call_commands.append({
                                 'component': component,
                                 'procedure': proc,
