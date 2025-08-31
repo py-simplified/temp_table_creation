@@ -241,7 +241,7 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
 
         # --- Final CTAS SQL ---
                 # New temp table name: <Target_Table>_<Source_Dataset_Id>_Temp
-        temp_table_name = f"{tbl}_{source['Source_Dataset_Id']}_Temp"
+        temp_table_name = f"{tbl}_Temp"
         ctas = f"""
         CREATE OR REPLACE TABLE `{proj}.{ds}.{temp_table_name}` AS
         SELECT
@@ -249,7 +249,7 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
         FROM `{source['Source_Project_Id']}.{source['Source_Dataset_Id']}.{source['Source_Table']}` AS `{source['Source_Table']}`
         {join_sql}
         """
-        ctas_sqls.append({"table": temp_table_name, "sql": ctas.strip()})
+        ctas_sqls.append({"table": temp_table_name, "sql": ctas.strip(), "project": proj, "dataset": ds})
     return ctas_sqls
 
     # --- CTAS SQL Preview Helper ---
@@ -284,7 +284,7 @@ def generate_ctas_sqls(config_df: pd.DataFrame, selected_targets: Optional[List[
                 ctas_sqls.append(f"-- ERROR: Target {tbl} from {src_ds} has no columns to select.")
                 continue
             # Build CTAS with source dataset in table name
-            temp_table_name = f"{tbl}_{source['Source_Dataset_Id']}_Temp"
+            temp_table_name = f"{tbl}_Temp"
             ctas = f"""
     CREATE OR REPLACE TABLE `{proj}.{ds}.{temp_table_name}` AS
 SELECT
@@ -386,7 +386,10 @@ with tabs[0]:
                 st.subheader("Preview: Create Table As Select SQL for Selected Targets")
                 if ctas_sqls:
                     for item in ctas_sqls:
-                        st.markdown(f"### Target Table: `{item['table']}`")
+                        proj_show = item.get('project', PROJECT_ID)
+                        ds_show = item.get('dataset', DATASET_ID)
+                        st.markdown(f"### Project: `{proj_show}` · Dataset: `{ds_show}` · Target Table: `{item['table']}`")
+
                         st.code(item['sql'], language="sql")
                 else:
                     st.info("No SQL to preview. Check your selection or config table.")
@@ -410,13 +413,24 @@ with tabs[0]:
 </div>
 """, unsafe_allow_html=True)
 
+            # Calculate and display total time taken instead of start and finish times
             if st.button("Run Stored Procedure", type="primary", key="run_proc_btn_temp_tab"):
                 try:
-                    start = time.strftime("%Y-%m-%d %H:%M:%S")
+                    start = time.time()
                     with st.spinner("Running stored procedure..."):
                         call_build_proc(selected, PROJECT_ID, DATASET_ID, PROC_NAME, TABLE_ID)
-                    end = time.strftime("%Y-%m-%d %H:%M:%S")
-                    st.success(f"Completed. Started: {start} · Finished: {end}")
+                    end = time.time()
+                    total_duration = end - start
+                    hours = int(total_duration // 3600)
+                    minutes = int((total_duration % 3600) // 60)
+                    seconds = int(total_duration % 60)
+                    time_str = []
+                    if hours > 0:
+                        time_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                    if minutes > 0:
+                        time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                    time_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+                    st.success(f"Process completed. Total time taken: {', '.join(time_str)}")
                     st.code(proc_cmd, language="sql")
                 except Exception as e:
                     st.exception(e)
@@ -431,16 +445,32 @@ with tabs[0]:
             config_df = preview_config(PROJECT_ID, DATASET_ID, TABLE_ID, 1000)
             ctas_sqls = generate_ctas_sqls(config_df, selected)
             for item in ctas_sqls:
-                temp_table = item['table']
+                temp_table = item['table'] if str(item['table']).endswith('_Temp') else f"{item['table']}_Temp"
                 try:
-                    # Extract base table and source dataset from temp table name
+                    # Normalize base (remove trailing _Temp) and search config in two steps:
+                    # 1) direct Target_Table == base
+                    # 2) fallback to Target_Table + '_' + Source_Dataset_Id == base
                     if temp_table.endswith('_Temp'):
+                        base = temp_table[:-5]  # remove '_Temp'
+                        base_norm = base.strip().lower()
+
+                        # Step 1: direct Target_Table match (normalized)
                         match = config_df[
                             config_df.apply(
-                                lambda row: f"{row['Target_Table']}_{row['Source_Dataset_Id']}_Temp" == temp_table,
+                                lambda row: str(row.get('Target_Table', '')).strip().lower() == base_norm,
                                 axis=1
                             )
                         ]
+
+                        # Step 2: fallback to Target_Table + '_' + Source_Dataset_Id
+                        if match.empty:
+                            match = config_df[
+                                config_df.apply(
+                                    lambda row: f"{str(row.get('Target_Table','')).strip()}_{str(row.get('Source_Dataset_Id','')).strip()}".lower() == base_norm,
+                                    axis=1
+                                )
+                            ]
+
                         if not match.empty:
                             proj = match.iloc[0]['Target_Project_Id']
                             ds = match.iloc[0]['Target_Dataset_Id']
@@ -494,8 +524,10 @@ with tabs[1]:
                             job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
                         else:
                             job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
-                        for col in df.columns:
-                            df[col] = df[col].astype(str)
+                        # Preserve empty cells as empty strings (''), and ensure all columns are strings
+                        # This avoids pandas converting NaN to the literal string 'nan' while keeping
+                        # the destination columns as STRING in BigQuery.
+                        df = df.fillna("").astype(str)
                         with st.spinner(f"Uploading {sheet} to {table_fqn}..."):
                             client.load_table_from_dataframe(df, table_fqn, job_config=job_config).result()
                     st.success(f"Uploaded {', '.join(selected_sheets)} to BigQuery.")
