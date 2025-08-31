@@ -10,6 +10,7 @@ from google.cloud import bigquery
 from google.cloud.bigquery import SchemaField
 from google.cloud.bigquery import LoadJobConfig
 from google.cloud.bigquery import ScalarQueryParameter, ArrayQueryParameter
+from sql_test_creator import render_sql_test_creator_tab
 
 # -----------------------------
 # Configuration
@@ -306,6 +307,34 @@ def call_build_proc(selected: Optional[List[str]], project_id: str, dataset_id: 
     job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
     job.result()
 
+def post_procedure_steps():
+    # Robust demo notification to make the post-procedure hook unmistakable in the UI.
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    msg = f"Post-procedure steps completed successfully! (Demo message) — {ts}"
+    # Keep a small session log so user can inspect if messages were shown
+    if "post_proc_log" not in st.session_state:
+        st.session_state["post_proc_log"] = []
+    st.session_state["post_proc_log"].append(msg)
+    # Visible messages
+    st.success(msg)
+    # Looker Studio report (open in new tab). We attempt a best-effort auto-open via JS;
+    # browsers may block automatic window.open — the clickable link is always available.
+    looker_url = "https://lookerstudio.google.com/reporting/9f6bc074-9eed-4150-8638-3b61d2bb609f"
+    # Prominent clickable link
+    st.markdown(
+        f'<a href="{looker_url}" target="_blank" rel="noopener noreferrer" '
+        f'style="font-weight:600; background:#1f77b4; color:white; padding:8px 12px; '
+        f'border-radius:6px; text-decoration:none;">Open Looker Studio report</a>',
+        unsafe_allow_html=True,
+    )
+    # Best-effort auto-open (may be blocked by popup blockers). This is harmless if blocked.
+    st.markdown(
+        f'<script>try{{window.open("{looker_url}", "_blank");}}catch(e){{console.log("popup blocked",e);}}</script>',
+        unsafe_allow_html=True,
+    )
+    # Also print to console (useful when running locally)
+    print(msg)
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -314,14 +343,15 @@ def call_build_proc(selected: Optional[List[str]], project_id: str, dataset_id: 
 
 # --- Tabs UI ---
 st.set_page_config(page_title="Validation Scenarios Manager", layout="wide")
-tabs = st.tabs(["Temporary Table Creator", "RAFT Comparison tool"])
+tabs = st.tabs(["ETL - Test Table Creator", "SQL - Test Creator", "RAFT Comparison tool"])
+
 
 # Tab 1: Temporary Table Creator (existing UI)
 with tabs[0]:
-    st.title("Validation Scenarios Manager")
+    # st.title("Validation Scenarios Manager")
     
     # BigQuery Configuration for Temp Table Creator - moved to main area
-    st.header("Temporary Table Creator Configuration")
+    st.header("ETL - Test Table Creator")
     col1, col2, col3 = st.columns(3)
     with col1:
         PROJECT_ID = st.text_input("Project ID", value="project-id", key="temp_project_id")
@@ -386,8 +416,8 @@ with tabs[0]:
                 st.subheader("Preview: Create Table As Select SQL for Selected Targets")
                 if ctas_sqls:
                     for item in ctas_sqls:
-                        proj_show = item.get('project', PROJECT_ID)
-                        ds_show = item.get('dataset', DATASET_ID)
+                        proj_show = item.get('project', PROJECT_ID) # type: ignore
+                        ds_show = item.get('dataset', DATASET_ID) # pyright: ignore[reportAttributeAccessIssue]
                         st.markdown(f"### Project: `{proj_show}` · Dataset: `{ds_show}` · Target Table: `{item['table']}`")
 
                         st.code(item['sql'], language="sql")
@@ -401,6 +431,8 @@ with tabs[0]:
     # --- Stored procedure expander: expanded only if components are selected ---
     with st.expander("4) Execute Stored Procedure", expanded=bool(selected and len(selected) > 0)):
         if selected and len(selected) > 0:
+            # Dedicated placeholder for post-procedure message to guarantee visible placement
+            post_placeholder_etl = st.empty()
             st.subheader("Stored Procedure Command to be Executed")
             targets_str = ', '.join([f"'{t}'" for t in selected])
             targets_array = f"[{targets_str}]"
@@ -431,6 +463,13 @@ with tabs[0]:
                         time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
                     time_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
                     st.success(f"Process completed. Total time taken: {', '.join(time_str)}")
+                    # Run post-procedure steps (demo hook) before showing the last log so the newest
+                    # message is presented to the user immediately (mirrors RAFT behavior).
+                    post_procedure_steps()
+                    # Surface the last post-proc log entry explicitly into the dedicated placeholder
+                    if st.session_state.get("post_proc_log"):
+                        last = st.session_state["post_proc_log"][-1]
+                        post_placeholder_etl.success(last)
                     st.code(proc_cmd, language="sql")
                 except Exception as e:
                     st.exception(e)
@@ -491,12 +530,15 @@ with tabs[0]:
     st.divider()
     st.caption("Note: Uses Application Default Credentials. Locally: `gcloud auth application-default login`.")
 
+with tabs[1]:  # SQL - Test Creator
+    render_sql_test_creator_tab()
+
 # Tab 2: RAFT Comparison tool (structure only, placeholder logic)
-with tabs[1]:
-    st.title("RAFT Comparison tool")
+with tabs[2]:
+    # st.title("RAFT Comparison tool")
     
     # RAFT BigQuery Configuration - moved to main area
-    st.header("RAFT BigQuery Configuration")
+    st.header("RAFT Comparison tool")
     col1, col2 = st.columns(2)
     with col1:
         RAFT_PROJECT_ID = st.text_input("RAFT Project ID", value="raft-project-id", key="raft_project_id")
@@ -670,6 +712,8 @@ with tabs[1]:
                     summary = []
                     # Use a Streamlit placeholder for the summary table
                     table_placeholder = st.empty()
+                    # Dedicated placeholder for post-procedure message to guarantee visible placement
+                    post_placeholder = st.empty()
                     process_start = time.time()
                     # Run in batches
                     for i in range(0, len(call_commands), batch_size):
@@ -716,6 +760,12 @@ with tabs[1]:
                         time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
                     time_str.append(f"{seconds} second{'s' if seconds != 1 else ''}")
                     st.success(f"Process completed. Total time taken: {', '.join(time_str)}")
+                    # Run post-procedure steps (demo hook) for RAFT path
+                    post_procedure_steps()
+                    # Also write the last post-procedure demo message into the dedicated placeholder
+                    if st.session_state.get("post_proc_log"):
+                        last = st.session_state["post_proc_log"][-1]
+                        post_placeholder.success(last)
                 else:
                     st.info("No procedures selected. Please select checkboxes in the Components Selection section.")
             else:
