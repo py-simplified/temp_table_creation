@@ -1,0 +1,84 @@
+# sql_test_creator.py
+
+import os
+import pandas as pd
+import streamlit as st
+import google.auth
+from google.cloud import bigquery
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def get_bq_client(project_id: str | None = None) -> bigquery.Client:
+    """Return an authenticated bigquery.Client using ADC."""
+    if project_id and "prod" in project_id:
+        os.environ["HTTP_PROXY"] = "googleapis-prod.gcp.cloud.uk.hsbc:3128"
+        os.environ["HTTPS_PROXY"] = "googleapis-prod.gcp.cloud.uk.hsbc:3128"
+    elif project_id and "dev" in project_id:
+        os.environ["HTTP_PROXY"] = "googleapis-dev.gcp.cloud.uk.hsbc:3128"
+        os.environ["HTTPS_PROXY"] = "googleapis-dev.gcp.cloud.uk.hsbc:3128"
+
+    credentials, _ = google.auth.default()
+    return bigquery.Client(credentials=credentials, project=project_id)
+
+
+def query_across_batches(
+    client: bigquery.Client, query_folder_path: str, batch_list: list[str]
+) -> None:
+    """Run all SQL queries in the given folder for each batch in the list."""
+    for position, batch in enumerate(batch_list):
+        for filename in os.listdir(query_folder_path):
+            full_path = os.path.join(query_folder_path, filename)
+            if os.path.isfile(full_path):
+                with open(full_path, "r") as file:
+                    query_str = file.read()
+                query_str = query_str.replace("DATASET", batch)
+                st.write(
+                    f"Running all queries for batch {position+1} – {batch} – query {filename}"
+                )
+                client.query(query_str).to_dataframe()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+
+def render_sql_test_creator_tab():
+    """Streamlit UI for SQL-based Test Creator."""
+
+    st.header("SQL-based Test Creator")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        project_id = st.text_input("Project ID", value="project-id", key="sql_project_id")
+    with col2:
+        dataset_id = st.text_input("Dataset ID", value="dataset-id", key="sql_dataset_id")
+
+    st.caption(f"Queries will run in project `{project_id}` and dataset `{dataset_id}`")
+
+    with st.expander("1) Load Batch Config (Excel)", expanded=False):
+        excel_file = st.file_uploader("Upload Excel with Batch IDs", type=["xlsx"])
+        sheet_name = st.text_input("Sheet Name", value="SQL_Batches", key="sql_sheet_name")
+        column_name = st.text_input("Batch ID Column", value="Batch_ID", key="sql_batch_col")
+        batch_list = []
+        if excel_file and st.button("Load Batches", key="load_batches_btn"):
+            try:
+                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                batch_list = df[column_name].dropna().astype(str).tolist()
+                st.success(f"Loaded {len(batch_list)} batches from Excel.")
+                st.session_state["sql_batches"] = batch_list
+            except Exception as e:
+                st.error(f"Failed to load batches: {e}")
+
+    with st.expander("2) Run SQLs across batches", expanded=False):
+        query_folder_path = st.text_input("Path to SQL folder", value="sqls")
+        if st.button("Run Queries", key="run_sql_btn"):
+            batches = st.session_state.get("sql_batches", [])
+            if not batches:
+                st.warning("No batches loaded. Please load batches first.")
+            else:
+                client = get_bq_client(project_id)
+                query_across_batches(client, query_folder_path, batches)
+                st.success("All queries executed.")
