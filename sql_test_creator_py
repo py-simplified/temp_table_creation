@@ -41,6 +41,26 @@ def query_across_batches(
                 client.query(query_str).to_dataframe()
 
 
+def query_files_across_batches(client: bigquery.Client, uploaded_files: list, batch_list: list[str]) -> None:
+    """Run uploaded SQL files (in-memory) for each batch in the list."""
+    for position, batch in enumerate(batch_list):
+        for uploaded in uploaded_files:
+            filename = getattr(uploaded, "name", "(uploaded)")
+            try:
+                query_bytes = uploaded.getvalue()
+                query_str = query_bytes.decode("utf-8")
+            except Exception:
+                # Fallback to latin-1 if UTF-8 fails
+                try:
+                    query_str = uploaded.getvalue().decode("latin-1")
+                except Exception:
+                    st.warning(f"Could not decode file {filename}, skipping.")
+                    continue
+            query_str = query_str.replace("DATASET", batch)
+            st.write(f"Running uploaded query for batch {position+1} – {batch} – query {filename}")
+            client.query(query_str).to_dataframe()
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -50,18 +70,19 @@ def render_sql_test_creator_tab():
 
     st.header("SQL-based Test Creator")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        project_id = st.text_input("Project ID", value="project-id", key="sql_project_id")
-    with col2:
-        dataset_id = st.text_input("Dataset ID", value="dataset-id", key="sql_dataset_id")
+    # Only project ID is required for running SQLs across batches; dataset is not used.
+    project_id = st.text_input("Project ID", value="project-id", key="sql_project_id")
 
-    st.caption(f"Queries will run in project `{project_id}` and dataset `{dataset_id}`")
+    st.caption(f"Queries will run in project `{project_id}`")
 
     with st.expander("1) Load Batch Config (Excel)", expanded=False):
-        excel_file = st.file_uploader("Upload Excel with Batch IDs", type=["xlsx"])
-        sheet_name = st.text_input("Sheet Name", value="SQL_Batches", key="sql_sheet_name")
-        column_name = st.text_input("Batch ID Column", value="Batch_ID", key="sql_batch_col")
+        excel_file = st.file_uploader("Upload Excel with Batch IDs", type=["xlsx"]) 
+        # Place sheet name and batch id column inputs side-by-side to save space
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            sheet_name = st.text_input("Sheet Name", value="SQL_Batches", key="sql_sheet_name")
+        with col_b:
+            column_name = st.text_input("Batch ID Column", value="Batch_ID", key="sql_batch_col")
         batch_list = []
         if excel_file and st.button("Load Batches", key="load_batches_btn"):
             try:
@@ -69,16 +90,64 @@ def render_sql_test_creator_tab():
                 batch_list = df[column_name].dropna().astype(str).tolist()
                 st.success(f"Loaded {len(batch_list)} batches from Excel.")
                 st.session_state["sql_batches"] = batch_list
+                # Show a compact summary so user can verify what's been loaded
+                unique_count = len(set(batch_list))
+                dup_count = len(batch_list) - unique_count
+                st.markdown("**Batch summary**")
+                st.write(f"Total rows: {len(batch_list)}  ·  Unique batches: {unique_count}  ·  Duplicates: {dup_count}")
+                # Show first 20 batches as a quick preview
+                try:
+                    preview_df = pd.DataFrame({column_name: batch_list})
+                    st.dataframe(preview_df.head(20), use_container_width=True)
+                except Exception:
+                    st.write(batch_list[:20])
             except Exception as e:
                 st.error(f"Failed to load batches: {e}")
 
     with st.expander("2) Run SQLs across batches", expanded=False):
-        query_folder_path = st.text_input("Path to SQL folder", value="sqls")
+        # Let the user choose whether to point to a folder path (server/local) or upload SQL files directly.
+        sql_source = st.radio("SQL source", ["Folder path", "Upload SQL files"], index=1, horizontal=True)
+
+        uploaded_files = None
+        query_folder_path = ""
+        if sql_source == "Folder path":
+            query_folder_path = st.text_input("Path to SQL folder", value="sqls")
+            st.caption("Folder path should be accessible from the machine running this Streamlit app.")
+        else:
+            uploaded_files = st.file_uploader("Upload .sql files", type=["sql"], accept_multiple_files=True)
+            if uploaded_files:
+                st.info(f"{len(uploaded_files)} file(s) ready to run.")
+                # Show a concise, scrollable list of filenames (no previews) to avoid duplication
+                try:
+                    names = [getattr(f, "name", "(uploaded)") for f in uploaded_files]
+                    list_items = "".join([f"<li style='margin-bottom:6px;'>{n}</li>" for n in names])
+                    html = (
+                        '<div style="max-height:320px; overflow:auto; padding:8px; '
+                        'border:1px solid #e6e6e6; border-radius:6px; background:#fff;">'
+                        f'<ul style="margin:0; padding-left:18px;">{list_items}</ul>'
+                        '</div>'
+                    )
+                    st.markdown(html, unsafe_allow_html=True)
+                except Exception:
+                    # Fallback to a simple text list if rendering fails
+                    for f in uploaded_files:
+                        st.write(getattr(f, "name", "(uploaded)"))
+
         if st.button("Run Queries", key="run_sql_btn"):
             batches = st.session_state.get("sql_batches", [])
             if not batches:
                 st.warning("No batches loaded. Please load batches first.")
             else:
                 client = get_bq_client(project_id)
-                query_across_batches(client, query_folder_path, batches)
-                st.success("All queries executed.")
+                if sql_source == "Folder path":
+                    if not query_folder_path:
+                        st.warning("Please provide a path to the SQL folder.")
+                    else:
+                        query_across_batches(client, query_folder_path, batches)
+                        st.success("All queries executed from folder.")
+                else:
+                    if not uploaded_files:
+                        st.warning("Please upload one or more .sql files to run.")
+                    else:
+                        query_files_across_batches(client, uploaded_files, batches)
+                        st.success("All uploaded queries executed.")
