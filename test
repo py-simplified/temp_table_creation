@@ -1,39 +1,96 @@
--- =====================================================
--- RAFT_AGG_BAL_CMPR_SP
--- =====================================================
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.My_Results.RAFT_AGG_BAL_CMPR_SP`(component_name STRING)
-BEGIN
-  SELECT *
-  FROM `cohesive-apogee-411113.My_Results.Validation_Scenarios`
-  LIMIT 1000;
-END;
+"""
+Scan a directory tree where each immediate child contains 5 subfolders.
+Mark Y if a subfolder has >=1 non-sample file, else N. Also record counts.
+"""
 
--- =====================================================
--- RAFT_DATA_CMPR_SP
--- =====================================================
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.My_Results.RAFT_DATA_CMPR_SP`(component_name STRING)
-BEGIN
-  SELECT *
-  FROM `cohesive-apogee-411113.My_Results.Validation_Scenarios`
-  LIMIT 1000;
-END;
+from pathlib import Path
+import re
+import pandas as pd
 
--- =====================================================
--- RAFT_METADATA_CMPR_SP
--- =====================================================
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.My_Results.RAFT_METADATA_CMPR_SP`(component_name STRING)
-BEGIN
-  SELECT *
-  FROM `cohesive-apogee-411113.My_Results.Validation_Scenarios`
-  LIMIT 1000;
-END;
+# ==== CONFIGURE THESE ====
+# The directory that contains many "parent" folders. Each parent should contain the 5 subfolders below.
+ROOT_DIR = r"C:\Users\Arnav\Documents\Python\TCoE\folder tracker\data folders"   # <- change this
 
--- =====================================================
--- RAFT_REFDATA_CMPR_SP
--- =====================================================
-CREATE OR REPLACE PROCEDURE `cohesive-apogee-411113.My_Results.RAFT_REFDATA_CMPR_SP`(component_name STRING)
-BEGIN
-  SELECT *
-  FROM `cohesive-apogee-411113.My_Results.Validation_Scenarios`
-  LIMIT 1000;
-END;
+# Exactly five subfolders expected under each parent folder (order defines column order).
+FIVE_SUBFOLDERS = [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+]
+
+# Filenames to ignore as "samples" (case-insensitive). You can add patterns.
+# A file is ignored if ANY pattern matches anywhere in its filename.
+SAMPLE_PATTERNS = [
+    r"\bsample\b",             # matches 'sample'
+    r"\bexample\b",            # matches 'example'
+    r"^test_",                 # files starting with test_
+    r"_sample(\.|$)",          # ends with _sample
+]
+
+# Output files (optional)
+YN_CSV_PATH = "scim_presence_table.csv"
+COUNTS_CSV_PATH = "scim_counts_table.csv"
+# =========================
+
+
+def is_sample(filename: str, compiled_patterns) -> bool:
+    """Return True if filename matches any sample pattern."""
+    name = filename.lower()
+    return any(p.search(name) for p in compiled_patterns)
+
+
+def count_real_files(folder: Path, compiled_patterns) -> int:
+    """Count non-sample regular files in a folder (non-recursive)."""
+    if not folder.exists() or not folder.is_dir():
+        return 0
+    count = 0
+    for p in folder.iterdir():
+        if p.is_file() and not is_sample(p.name, compiled_patterns):
+            count += 1
+    return count
+
+
+def main():
+    root = Path(ROOT_DIR)
+    if not root.exists() or not root.is_dir():
+        raise SystemExit(f"ROOT_DIR does not exist or is not a directory: {root}")
+
+    # Precompile regexes for efficiency
+    compiled_patterns = [re.compile(pat, re.IGNORECASE) for pat in SAMPLE_PATTERNS]
+
+    # Collect immediate child folders under ROOT_DIR (these become table rows)
+    parent_folders = sorted([p for p in root.iterdir() if p.is_dir()])
+
+    # Build raw counts matrix
+    data_counts = []
+    row_index = []
+    for parent in parent_folders:
+        row = []
+        for sub in FIVE_SUBFOLDERS:
+            subpath = parent / sub
+            row.append(count_real_files(subpath, compiled_patterns))
+        data_counts.append(row)
+        row_index.append(parent.name)
+
+    # DataFrames: counts and Y/N presence
+    df_counts = pd.DataFrame(data_counts, index=row_index, columns=FIVE_SUBFOLDERS)
+    df_presence = df_counts.applymap(lambda x: "Y" if x >= 1 else "N")
+
+    # Print to console
+    print("\n=== Presence (Y/N) ===")
+    print(df_presence.to_string())
+
+    print("\n=== Counts (non-sample files) ===")
+    print(df_counts.to_string())
+
+    # Save CSVs
+    df_presence.to_csv(YN_CSV_PATH, index=True)
+    df_counts.to_csv(COUNTS_CSV_PATH, index=True)
+    print(f"\nSaved Y/N table → {YN_CSV_PATH}")
+    print(f"Saved counts   → {COUNTS_CSV_PATH}")
+
+
+if __name__ == "__main__":
+    main()
